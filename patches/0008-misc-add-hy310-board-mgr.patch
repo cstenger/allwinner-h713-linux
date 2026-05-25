@@ -1,6 +1,6 @@
 --- a/drivers/misc/hy310-board-mgr.c	1970-01-01 01:00:00.000000000 +0100
-+++ b/drivers/misc/hy310-board-mgr.c	2026-04-01 23:40:18.070821141 +0200
-@@ -0,0 +1,1288 @@
++++ b/drivers/misc/hy310-board-mgr.c	2026-04-07 12:36:30.000000000 +0200
+@@ -0,0 +1,1295 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * HY310 Projector Board Management Driver
@@ -928,6 +928,7 @@
 +	u32 period_ns;
 +	u32 fan_policy;
 +	int fan_idx = 0;
++	u32 legacy_usb_gpio_fallback = 0;
 +	int ret;
 +	int i;
 +
@@ -1033,28 +1034,34 @@
 +		of_node_put(ntc_np);
 +	}
 +
-+	/* ---- gpios subnode: USB power GPIO ---- */
++	/* ---- gpios subnode: USB power GPIO (legacy fallback mode) ---- */
++	of_property_read_u32(np, "hy310,legacy-usb-gpio-fallback",
++			     &legacy_usb_gpio_fallback);
++
 +	gpios_np = of_get_child_by_name(np, "gpios");
 +	if (gpios_np) {
-+		priv->usb_power_gpio = of_get_named_gpio(
-+			gpios_np, "usb-power-gpio", 0);
++		//if (legacy_usb_gpio_fallback == 1) {
++			priv->usb_power_gpio = of_get_named_gpio(
++				gpios_np, "usb-power-gpio", 0);
 +
-+		if (gpio_is_valid(priv->usb_power_gpio)) {
-+			ret = devm_gpio_request_one(dev, priv->usb_power_gpio,
++			if (gpio_is_valid(priv->usb_power_gpio)) {
++				ret = devm_gpio_request_one(dev, priv->usb_power_gpio,
 +						    GPIOF_OUT_INIT_HIGH,
 +						    "usb-power");
-+			if (ret) {
-+				dev_warn(dev,
-+					 "usb-power-gpio request failed: %d\n",
-+					 ret);
-+				priv->usb_power_gpio = -EINVAL;
-+			} else {
-+				dev_info(dev, "USB power GPIO %d enabled\n",
-+					 priv->usb_power_gpio);
++				if (ret) {
++					dev_warn(dev,
++						 "usb-power-gpio request failed: %d\n",
++						 ret);
++					priv->usb_power_gpio = -EINVAL;
++				} else {
++					dev_info(dev,
++						 "USB power GPIO %d enabled (legacy fallback)\n",
++						 priv->usb_power_gpio);
++				}
 +			}
-+		}
 +		of_node_put(gpios_np);
 +	}
++
 +
 +	/* battery subnode: skipped — battery.enable=0 on HY310, power-hold
 +	 * shares PL3 with usb-power-gpio and is not relevant for this board. */
