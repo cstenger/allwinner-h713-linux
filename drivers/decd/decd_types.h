@@ -334,7 +334,8 @@ int dec_debug_dump(int dst, int len, int a3, int a4);
 int dec_debug_init(struct dec_device *dec);
 int video_info_memory_block_init(struct device *dev);
 void video_info_memory_block_exit(void);
-u32 video_info_buffer_init(struct dec_frame_submit_desc *desc);
+u32 video_info_buffer_init(struct dec_frame_submit_desc *desc,
+			   struct dec_frame_item *item);
 u32 video_info_buffer_init_dmabuf(struct dec_frame_item *item);
 void video_info_buffer_deinit(struct dec_frame_item *item);
 struct dec_frame_item *frame_item_create(struct dec_device *dec,

@@ -478,9 +478,23 @@ int video_buffer_unmap(u32 dma_addr)
 	return -ENOENT;
 }
 
-u32 video_info_buffer_init(struct dec_frame_submit_desc *desc)
+static struct dec_video_info_page *alloc_video_info_page(void);
+
+u32 video_info_buffer_init(struct dec_frame_submit_desc *desc,
+			   struct dec_frame_item *item)
 {
-	return lower_32_bits(desc->y_phys) + 4096;
+	/* INFO-PAGE FIX: stock allocates info-page from decd_reserved pool
+	 * (0x4d941000+128KB), NOT y_phys+4096 which collides with the Y-plane
+	 * content for raw NV12 frames. */
+	struct dec_video_info_page *page;
+
+	if (!item)
+		return 0;
+	page = alloc_video_info_page();
+	if (!page)
+		return 0;
+	item->video_info_page = page;
+	return (u32)page->paddr;
 }
 
 static void clean_video_info_free_list(void)
@@ -755,7 +769,7 @@ struct dec_frame_item *frame_item_create(struct dec_device *dec,
 		if (!item)
 			return NULL;
 		refcount_set(&item->refcount, 1);
-		item->video_info_addr = video_info_buffer_init(desc);
+		item->video_info_addr = video_info_buffer_init(desc, item);
 		item->y_addr = desc->y_phys;
 		item->c_addr = desc->c_phys;
 		goto setup_fields;
