@@ -18,3 +18,7 @@ staging/
 .vscode/
 
 .agents_sandbox/
+
+# Session backup files (do not commit)
+*.bak
+*.bak.*
