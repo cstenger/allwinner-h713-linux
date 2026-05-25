@@ -210,7 +210,7 @@ bootm 45000000
 
 ### UART Access
 
-The HY310 serial console is at 115200 8N1. See [docs/UART.md](docs/UART.md) for
+The HY310 serial console is at 115200 8N1. See [docs/subsystems/uart.md](docs/subsystems/uart.md) for
 hardware connection details, U-Boot interrupt instructions, and recovery commands.
 
 > **NOTE:** The stock U-Boot has `bootdelay=0` — you cannot interrupt boot without

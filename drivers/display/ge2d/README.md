@@ -55,4 +55,4 @@ TERM=linux fbterm --font-size=36 -- bash
 - afbd clock is 150MHz instead of required 200MHz
 - PB5 is shared between panel backlight and fan power — never set LOW
 
-See [docs/DISPLAY.md](../../docs/DISPLAY.md) for full analysis.
+See [docs/subsystems/display.md](../../docs/subsystems/display.md) for full analysis.
