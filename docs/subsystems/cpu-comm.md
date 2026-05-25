@@ -18,7 +18,7 @@ If that works, the IPC is alive.
 
 - **Shared memory**: 5 MB at ARM-phys `0x4E300000` (MIPS-VA `0xAE300000`)
 - **Msgbox**: HW mailbox at `0x03003000`, user region 2 for MIPS peer
-- **HW spinlocks**: `0x03005000`, sun6i-style
+- **HW spinlocks**: `0x03004000`, sun6i-style
 
 Address translation between ARM and MIPS:
 - code/data: `phys = MIPS-VA - 0x40000000`

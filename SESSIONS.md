@@ -52,7 +52,7 @@ matter because re-trying them is expensive.
   `0x8B1219A4`, FIFO management at `0x8B11D418`/`0x8B118B84`, name-hash
   generator at `0x8B1247EC`.
 - The MIPS firmware uses ThreadX queues + HISR-worker scheduling, with HW
-  spinlocks at `0x03005000`.
+  spinlocks at `0x03004000`.
 - 29 MIPS functions reverse-engineered + named (session H), enabling all the
   later patches.
 

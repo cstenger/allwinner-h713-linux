@@ -40,7 +40,7 @@ ARM calls them like RPC functions.
 **Transport**:
 - 5 MB shared memory at ARM-phys `0x4E300000` (= MIPS-VA `0xAE300000`).
 - Hardware Msgbox at `0x03003000` (user region 2 for the MIPS peer).
-- HW spinlocks at `0x03005000` for the shared-mem ringbuffer.
+- HW spinlocks at `0x03004000` for the shared-mem ringbuffer.
 
 **Protocol** (one 168-byte CALL packet):
 - `msg[2..3]` u16 `dst_cpu` (1 = MIPS)

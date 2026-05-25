@@ -30,7 +30,7 @@ Three communications buses connect the CPUs:
 - **Msgbox** (`0x03003000`) — 3 user regions for ARM↔MIPS↔ARISC mailbox.
   Edge-triggered on H713 (not level-triggered like H6).
 - **Shared memory** (`0x4E300000`, 5 MB) — primary ARM↔MIPS data channel.
-- **HW spinlocks** (`0x03005000`, 16× 4-byte) — sun6i-style, used by
+- **HW spinlocks** (`0x03004000`, 16× 4-byte) — sun6i-style, used by
   `cpu_comm`.
 
 ## Memory map (top hits)
@@ -44,7 +44,7 @@ Three communications buses connect the CPUs:
 | `cpu_comm_reserved` (SharedMem) | 0x4E300000–0x4E7FFFFF | 5 MB ARM↔MIPS IPC |
 | u-boot bootlogo | 0x78541000 | leftover from boot screen |
 | msgbox HW | 0x03003000 | 3× 0x400 user regions |
-| HW spinlocks | 0x03005000 | sun6i-style |
+| HW spinlocks | 0x03004000 | sun6i-style |
 | MIPS-INTC | 0x03061300+ | MIPS interrupt controller |
 | MIPS-loader regs | 0x03061000+ | SHARE_ADDR, SHARE_SIZE, BOOT_ADDR |
 | HDMI-RX Synopsys | 0x050C0000–0x050CFFFF | DW-HDMI-RX (CMU/PHY/SCDC/DMA, EDID-RAM) |
