@@ -30,9 +30,10 @@ monolithic files that preceded the modular approach entirely.
 
 The actively maintained out-of-tree modules are at:
 
-- [`drivers/display/tvtop/`](../display/tvtop/)
-- [`drivers/display/decd/`](../display/decd/)
+- [`drivers/tvtop/`](../tvtop/)
+- [`drivers/decd/`](../decd/)
 - [`drivers/cpu_comm/`](../cpu_comm/)
 
-See [`docs/CPU_COMM.md`](../../docs/CPU_COMM.md) and
-[`docs/DISPLAY.md`](../../docs/DISPLAY.md) for subsystem documentation.
+See [`docs/subsystems/cpu-comm.md`](../../docs/subsystems/cpu-comm.md) and
+[`docs/subsystems/display.md`](../../docs/subsystems/display.md) for subsystem
+documentation.
