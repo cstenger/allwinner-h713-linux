@@ -49,7 +49,6 @@
 		 *   Total:       40MB
 		 */
 		mips_reserved: mipsloader@4b100000 {
-			compatible = "shared-dma-pool";
 			reg = <0x4b100000 0x0e41000>;
 			no-map;
 		};
@@ -783,7 +782,16 @@
 			cap-mmc-highspeed;
 			mmc-ddr-1_8v;
 			mmc-hs200-1_8v;
-			mmc-hs400-1_8v;
+			/*
+			 * mmc-hs400-1_8v absichtlich NICHT gesetzt: dieses
+			 * HY310-exemplar hat marginales eMMC-timing bei HS400
+			 * (kernel cmd25 CRC-fails unter last, RINT=0x10). Der
+			 * sunxi-mmc-treiber ignoriert max-frequency-caps im
+			 * HS400-mode, also bleibt als stabile lösung nur
+			 * HS400-support im DT rauszunehmen — kernel fallback
+			 * auf HS200@200MHz, tuning-window bei diesem chip
+			 * deutlich breiter (~49 steps statt ~13).
+			 */
 			max-frequency = <200000000>;
 			status = "okay";
 		};
@@ -939,11 +947,18 @@
 		 * Address 0x02010000 is the H713 IOMMU MMIO base (unverified).
 		 */
 		iommu: iommu@30f0000 {
-			compatible = "allwinner,sun50i-h6-iommu";
+			/*
+			 * H713 IOMMU (panfrost / GPU side). Hardware is
+			 * register-compatible with sun50i-h6-iommu, but H713
+			 * lacks a dedicated RST_BUS_IOMMU in its CCU. The
+			 * sun50i-iommu driver now recognises a dedicated
+			 * H713 compat and treats the reset line as optional.
+			 */
+			compatible = "allwinner,sun50i-h713-iommu",
+				     "allwinner,sun50i-h6-iommu";
 			reg = <0x030f0000 0x10000>;
 			interrupts = <GIC_SPI 24 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&ccu CLK_BUS_IOMMU>;
-			resets = <&ccu 11>;
 			#iommu-cells = <1>;
 			status = "okay";
 		};
@@ -1013,7 +1028,7 @@
 			 * driver marks index 2 as GENPD_FLAG_ALWAYS_ON.
 			 * GPU is powered on at boot; Panfrost uses runtime PM via genpd.
 			 */
-			power-domains = <&ppu 2>;
+			power-domains = <&pmu_ctrl 0>;
 			#cooling-cells = <2>;
 			status = "okay";
 		};
@@ -1051,14 +1066,14 @@
 			};
 		};
 
-		/* === Watchdog === */
-		watchdog: watchdog@2051000 {
-			compatible = "allwinner,sun50i-h6-wdt",
-				     "allwinner,sun6i-a31-wdt";
-			reg = <0x02051000 0x20>;
-			interrupts = <GIC_SPI 46 IRQ_TYPE_LEVEL_HIGH>;
-			clocks = <&osc24M>;
-		};
+		/*
+		 * Watchdog removed 2026-04-18: no in-tree user, node had no
+		 * phandle references, HW was dormant (IRQ 46 never requested
+		 * by the driver — confirmed via /proc/interrupts). IRQ 46 now
+		 * belongs exclusively to the msgbox RX path so we don't need
+		 * IRQF_SHARED. To re-enable WDT later, put the node back and
+		 * add IRQF_SHARED to the msgbox request_irq call.
+		 */
 
 		/* === R-domain: RTC, R_CCU, R_PIO, IR === */
 
@@ -1101,32 +1116,58 @@
 		};
 
 		/*
-		 * H713 PRCM PPU — power domain controller (IDA RE from stock kernel).
+		 * TV303 PMU — power-management unit at 0x07001000 (separate
+		 * from R_CCU at 0x07010000, despite both being in the R-domain).
 		 *
-		 * The PPU register block is embedded within the R_CCU physical
-		 * address range (0x07010000). The driver uses of_iomap() (no
-		 * resource request) to avoid EBUSY conflict with the R_CCU driver.
+		 * Bound as MFD parent (syscon + simple-mfd); the
+		 * "power-controller" child is handled by sun50i-tv303-pmu.c and
+		 * exposes 5 power domains. Reverse-engineered from Allwinner
+		 * stock vmlinux (2026-04-24) — see driver header for addresses.
 		 *
-		 * 5 domains (DT indices 0-4):
-		 *   0: CPUS (hw domain_id=0, registers at 0x07010020/24)
-		 *   1: SYS  (hw domain_id=1, registers at 0x070100A0/A4)
-		 *   2: GPU  (always-on; domain_info[2] is all-zeros in stock binary)
-		 *   3: VE   (hw domain_id=3, registers at 0x070101A0/A4)
-		 *   4: DE   (hw domain_id=4, registers at 0x07010220/24)
-		 *
-		 * Source: IDA analysis of vmlinux.fex, sunxi_pmu_info @ 0xC0EA3D90,
-		 *         compatible "allwinner,tv303-power-controller".
+		 * Domain layout (TV303 projector variant):
+		 *   0: pd_gpu
+		 *   1: pd_tvfe   — TV front-end
+		 *   2: pd_tvcap  — TV capture / HDMI-RX (placeholder, left as
+		 *                  bootloader set it)
+		 *   3: pd_ve
+		 *   4: pd_av1
 		 */
-		ppu: power-controller@7010000 {
-			compatible = "allwinner,sun50i-h713-ppu";
-			/* Same physical range as R_CCU; driver uses of_iomap (no request) */
-			reg = <0x07010000 0x240>;
-			clocks = <&r_ccu CLK_BUS_R_PPU>;
-			clock-names = "ppu";
-			resets = <&r_ccu RST_BUS_R_PPU>;
-			reset-names = "ppu_rst";
-			#power-domain-cells = <1>;
-			status = "okay";
+		pmu: power-management@7001000 {
+			compatible = "allwinner,tv303-pmu", "syscon", "simple-mfd";
+			reg = <0x07001000 0x400>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			pmu_ctrl: power-controller {
+				compatible = "allwinner,tv303-power-controller";
+				clocks = <&r_ccu CLK_BUS_R_PPU>;
+				clock-names = "ppu";
+				resets = <&r_ccu RST_BUS_R_PPU>;
+				reset-names = "ppu_rst";
+				#power-domain-cells = <1>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				pd_gpu: pd_gpu@0 {
+					reg = <0>;
+				};
+
+				pd_tvfe: pd_tvfe@1 {
+					reg = <1>;
+				};
+
+				pd_tvcap: pd_tvcap@2 {
+					reg = <2>;
+				};
+
+				pd_ve: pd_ve@3 {
+					reg = <3>;
+				};
+
+				pd_av1: pd_av1@4 {
+					reg = <4>;
+				};
+			};
 		};
 
 		/* R-domain pinctrl for PL/PM banks (IR, S_PWM, WLAN/BT GPIOs) */
@@ -1182,29 +1223,12 @@
 		 */
 
 		/*
-		 * MIPS Display Co-processor (dec@5600000)
-		 * The DEC node is the parent container for the MIPS subsystem.
-		 * Stock DTS: compatible = "allwinner,sunxi-dec", "simple-bus"
-		 * Contains the mipsloader child node.
+		 * MIPS Display Co-processor (mipsloader)
+		 * HY310-fix 2026-04-19: moved to be a child of dec@5600000 to
+		 * match Stock DTS layout exactly. Stock has:
+		 *   dec@5600000 (simple-bus) { mipsloader@3061000 { ... } }
+		 * See the dec: node below for the definition.
 		 */
-		/*
-		 * MIPS Co-processor Loader
-		 * Loads display.bin firmware to 0x4b100000 (40MB region)
-		 * Controls MIPS boot/halt via bus-reset, cold-reset, soft-reset
-		 * Stock: child of dec@5600000, but we make it standalone for cleaner probe
-		 */
-		mipsloader: mipsloader@3061000 {
-			compatible = "allwinner,sunxi-mipsloader";
-			reg = <0x03061000 0x100>;
-			resets = <&ccu RST_BUS_MIPS>,
-				 <&ccu RST_BUS_MIPS_DBG>,
-				 <&ccu RST_BUS_MIPS_CFG>;
-			reset-names = "bus-reset", "cold-reset", "soft-reset";
-			clocks = <&ccu CLK_BUS_MIPS>, <&ccu CLK_MIPS>;
-			clock-names = "bus-clk", "mips-clk";
-			memory-region = <&mips_reserved>;
-			status = "okay";
-		};
 
 		/*
 		 * GE2D Display Controller (trix,ge2d)
@@ -1339,12 +1363,69 @@
 		};
 
 		/*
-		 * MIPS Display Decoder (dec@5600000)
-		 * Shares tvtop register space + has own AFBD registers.
-		 * Stock compatible: "allwinner,sunxi-dec"
+		 * TV-system IOMMU client markers (stock-DTB parity).
+		 *
+		 * Stock binds these to compat "allwinner,sunxi-tvsystem-iommu-dev"
+		 * and wires them to a separate TV-IOMMU at 0x02010000 (different
+		 * HW from the panfrost-side sun50i-h713-iommu at 0x030f0000).
+		 *
+		 * We do not (yet) have a TV-IOMMU driver; U-Boot leaves that
+		 * controller in BYPASS so DMA goes straight to physical RAM.
+		 * The nodes remain present as presence-markers and so that any
+		 * future TV-IOMMU driver can resolve its consumers cleanly.
+		 *
+		 * tvcap = HDMI-RX / capture pipeline @ 0x06800000 — the DMA
+		 *         target of the capture engine. pd_tvcap power-domain
+		 *         link keeps the rail consumer-visible.
+		 * tvdisp = display output pipeline @ 0x05000000.
+		 */
+		tvcap: tvcap@6800000 {
+			compatible = "allwinner,sunxi-tvsystem-iommu-dev";
+			power-domains = <&pmu_ctrl 2>;
+			status = "okay";
+		};
+
+		/*
+		 * tvdisp IOMMU placeholder. Renamed from @5000000 to @1 because
+		 * the actual 0x05000000 MMIO region is now claimed by the HDMI-RX
+		 * controller node (see hdmi_rx@5000000 below). This node carries no
+		 * reg property — it exists only as a power-domain consumer marker.
+		 */
+		tvdisp: tvdisp@1 {
+			compatible = "allwinner,sunxi-tvsystem-iommu-dev";
+			power-domains = <&pmu_ctrl 1>;
+			status = "okay";
+		};
+
+		/*
+		 * tvtop_pm: stock-DTB consumer-bridge that requests pd_tvcap +
+		 * pd_tvfe from the PMU. On our tree both domains are already
+		 * marked ALWAYS_ON (bootloader keeps them on), so this node is
+		 * informational — present for stock parity and to let any future
+		 * allwinner,sunxi-tvtop-pm driver bind cleanly.
+		 *
+		 * References the pmu_ctrl phandle with domain indices matching
+		 * the stock layout (pd_tvcap = 2, pd_tvfe = 1).
+		 *
+		 * Unit address 66666 matches stock exactly (arbitrary marker).
+		 */
+		tvtop_pm: tvtop_pm@66666 {
+			compatible = "allwinner,sunxi-tvtop-pm";
+			power-domains = <&pmu_ctrl 2>, <&pmu_ctrl 1>;
+			power-domain-names = "pd_tvcap", "pd_tvfe";
+			status = "okay";
+		};
+
+		/*
+		 * MIPS Display Decoder (dec@5600000) — simple-bus parent
+		 * HY310-fix 2026-04-19: add "simple-bus" + ranges + mipsloader
+		 * child node to match Stock DTS exactly. Stock probes dec first,
+		 * then mipsloader as child. Our previous flat layout may have
+		 * missed probe-order dependency for MIPS IRQ path activation.
+		 * Stock compatible: "allwinner,sunxi-dec", "simple-bus"
 		 */
 		dec: dec@5600000 {
-			compatible = "allwinner,sunxi-dec";
+			compatible = "allwinner,sunxi-dec", "simple-bus";
 			reg = <0x05700000 0x100>,
 			      <0x05600000 0x400>;
 			interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH>;
@@ -1355,7 +1436,45 @@
 			reset-names = "rst_bus_disp";
 			memory-region = <&decd_reserved>;
 			clock-frequency = <200000000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges;
 			status = "okay";
+
+			mipsloader: mipsloader@3061000 {
+				compatible = "allwinner,sunxi-mipsloader";
+				reg = <0x03061000 0x100>;
+				resets = <&ccu RST_BUS_MIPS>,
+					 <&ccu RST_BUS_MIPS_DBG>,
+					 <&ccu RST_BUS_MIPS_CFG>;
+				reset-names = "bus-reset", "cold-reset", "soft-reset";
+				clocks = <&ccu CLK_BUS_MIPS>, <&ccu CLK_MIPS>;
+				clock-names = "bus-clk", "mips-clk";
+				memory-region = <&mips_reserved>;
+				status = "okay";
+			};
+		};
+
+		/*
+		 * NMI / Wakeup Interrupt Controller @ 0x07010320 (12 bytes)
+		 * HY310-fix 2026-04-19: activated. Stock DTB shows this node
+		 * with compatible "allwinner,sun8i-nmi", parent GIC_SPI 172
+		 * (0xAC). Mainline driver drivers/irqchip/irq-sunxi-nmi.c
+		 * binds "allwinner,sun9i-a80-nmi" which has the same register
+		 * layout (ctrl/pend/enable at +0/+4/+8). Driver init writes
+		 * these registers — hypothesized to have side-effect that
+		 * enables cross-CPU IRQ routing (needed for msgbox → MIPS-CP0).
+		 *
+		 * Stock's root uses interrupt-parent = <wakeupgen> which isn't
+		 * in mainline; we keep our root at <&gic>. This node alone
+		 * being probed should still trigger the HW init side-effects.
+		 */
+		nmi_intc: interrupt-controller@7010320 {
+			compatible = "allwinner,sun9i-a80-nmi";
+			reg = <0x07010320 0xc>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts = <GIC_SPI 172 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
 		/* NSI Bus Priority Controller */
@@ -1386,19 +1505,85 @@
 			status = "okay";
 		};
 
+		/*
+		 * Msgbox AMP — rpmsg backend, stock-compatible.
+		 * Stock H713 hy310-board.dts deklariert 2 channels:
+		 *   ch0 → ARISC (amp_remote=2)
+		 *   ch1 → MIPS  (amp_remote=1)
+		 * msgbox_amp_counts = 3 (stock value, even though only 2 channels are listed).
+		 *
+		 * IRQs werden in P1 NICHT von msgbox_amp geclaimt — cpu_comm hat sie noch
+		 * (kein IRQF_SHARED in beiden treibern, würde sonst probe-failure geben).
+		 * In P2 wird sunxi_arisc_rpm gebraucht der RX braucht — dann werden IRQs
+		 * migriert (entweder beide IRQF_SHARED oder cpu_comm gibt sie ab).
+		 */
+		msgbox_amp: msgbox@3003000 {
+			compatible = "sunxi,msgbox-amp";
+			reg = <0x03003000 0x400>,
+			      <0x03003400 0x400>,
+			      <0x03003800 0x400>;
+			/* P2-fix 2026-04-25: msgbox_amp now shares IRQ 345
+			 * (SPI 46 = USER0 region RX) with cpu_comm via IRQF_SHARED.
+			 * SPI 108/109 (USER1/USER2 RX) intentionally NOT claimed —
+			 * those IRQs are for ARISC's and MIPS's own peer-side
+			 * notifications and ARM doesn't use them. */
+			interrupts = <GIC_SPI 46 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&ccu CLK_BUS_MSGBOX>;
+			resets = <&ccu RST_BUS_MSGBOX>;
+			reset-names = "rst";
+
+			msgbox_amp_counts = <3>;
+			msgbox_amp_local = <0>;
+
+			/* CORRECTED 2026-04-25: amp_remote values match stock DTS.
+			 * Stock has ARISC=remote 1 (USER1 region 0x03003400),
+			 * MIPS=remote 2 (USER2 region 0x03003800).
+			 * sx_ept_send computes addr = base[remote] + offset, so
+			 * remote MUST match the user-region where the peer reads. */
+			rpmsg_id = "sunxi,cpus-msgbox", "sunxi,mips-msgbox";
+
+			/* channel 0: cpus-msgbox → ARISC, region USER1
+			 * Port 3 (NOT stock's 1): session-N's ARISC firmware-RE shows
+			 * msgbox_recv polls FIFO_STAT @ 0x0300346c = USER1 sub0 port 3.
+			 * Direct-MMIO P0 test confirmed port 3 is where ARISC's BOP/SCPI
+			 * dispatcher reads. Stock-DTS port=1 reaches HW (RX_IRQ bit toggles)
+			 * but the dispatcher poll-loop at port 3 misses it. */
+			rpmsg_amp_remote-0 = <1>;
+			rpmsg_read_channel-0 = <3>;
+			rpmsg_write_channel-0 = <3>;
+
+			/* channel 1: mips-msgbox → MIPS, region USER2 */
+			rpmsg_amp_remote-1 = <2>;
+			rpmsg_read_channel-1 = <1>;
+			rpmsg_write_channel-1 = <1>;
+
+			status = "okay";
+		};
+
+		/*
+		 * cpu_comm — driver retains IRQ ownership of msgbox in P1.
+		 * reg removed: cpu_comm.c uses hardcoded ioremap(0x03003000, 0x800)
+		 * to access msgbox; removing reg from DT prevents request_mem_region
+		 * collision with msgbox_amp's devm_ioremap_resource.
+		 *
+		 * IRQs from stock DTS: 46 (0x2E), 109 (0x6D), 108 (0x6C).
+		 * IRQ 46 is shared with the watchdog.
+		 */
 		cpu_comm: cpu-comm {
 			compatible = "allwinner,sunxi-cpu-comm";
-			reg = <0x03003000 0x400>;
-			/*
-			 * Msgbox IRQs from stock DTS mailbox@3003000:
-			 * 46 (0x2E), 109 (0x6D), 108 (0x6C).
-			 * Stock had these on a separate mailbox node; our
-			 * cpu_comm drives the msgbox hardware directly.
-			 * IRQ 46 is shared with the watchdog.
-			 */
+			/* 2026-05-03 RE-ADDED SPI 108+109. Stock /proc/interrupts
+			 * shows all 3 lines fire over an active session
+			 * (SPI 46: 3134, SPI 108: 546, SPI 109: 63). Without
+			 * listening on 108/109, MIPS RETURN msgbox events may
+			 * go unprocessed → ARM never sees type=1 → BG_Thread
+			 * stuck in WAIT ACK completion → FreeCall pool drains.
+			 * Mitigation for session-K's IRQ-storm: handler must
+			 * return IRQ_HANDLED even on empty FIFO to avoid
+			 * kernel-disable when msgbox_amp pulses TX_IRQ_EN.
+			 * Shared with msgbox_amp via IRQF_SHARED. */
 			interrupts = <GIC_SPI 46 IRQ_TYPE_LEVEL_HIGH>,
-				     <GIC_SPI 109 IRQ_TYPE_LEVEL_HIGH>,
-				     <GIC_SPI 108 IRQ_TYPE_LEVEL_HIGH>;
+				     <GIC_SPI 108 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 109 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&ccu CLK_BUS_MSGBOX>;
 			resets = <&ccu RST_BUS_MSGBOX>;
 			mips-loader = <&mipsloader>;
@@ -1408,10 +1593,28 @@
 		};
 
 		/*
-		 * HDMI Display Output
-		 * DW-HDMI controller + PHY + connector.
-		 * Clock/Reset IDs from sun50i-h713-ccu.h bindings.
-		 * pinctrl-0 references hdmi_pins defined inside &pio.
+		 * HDMI-TX path (hdmi@5010000 + hdmi_phy@5040300 + hdmi_connector).
+		 *
+		 * DISABLED 2026-04-28: HY310 hardware does not route HDMI-TX out of
+		 * the SoC — the only display output is the DLP/LCOS panel via the
+		 * MIPS display pipeline. Stock vendor kernel never enabled the
+		 * sun8i-dw-hdmi driver path either.
+		 *
+		 * Active failures observed before disabling:
+		 *   - sun50i-h713-pinctrl: "unsupported function hdmi" on PH8/9/10
+		 *     (the H713 pinctrl driver has no "hdmi" mux entry)
+		 *   - sun8i-dw-hdmi 5010000.hdmi: "no valid maps for state default"
+		 *
+		 * The CLK_BUS_HDMI / CLK_HDMI / CLK_HDCP / CLK_BUS_HDCP / CLK_HDMI_SLOW /
+		 * CLK_HDMI_CEC clocks AND RST_BUS_HDMI / RST_BUS_HDMI_SUB / RST_BUS_HDCP
+		 * resets in the CCU driver are H6-reference carry-overs marked
+		 * "TODO: verify" — they exist as register definitions but the
+		 * underlying H713 silicon offsets at 0xb00/0xb04/0xb10/0xb1c/0xc40/0xc4c
+		 * have not been verified against stock vmlinux RE.
+		 *
+		 * The proper HDMI ingress path on HY310 is hdmi_rx@5000000 below.
+		 * Re-enable this block only after PH8/9/10 mux + clock offsets are
+		 * confirmed, and only if downstream HDMI-TX use-case appears.
 		 */
 		hdmi: hdmi@5010000 {
 			compatible = "allwinner,sun50i-h713-dw-hdmi",
@@ -1432,9 +1635,7 @@
 			reset-names = "ctrl", "hdcp";
 			phys = <&hdmi_phy>;
 			phy-names = "phy";
-			pinctrl-names = "default";
-			pinctrl-0 = <&hdmi_pins>;
-			status = "okay";
+			status = "disabled";
 
 			ports {
 				#address-cells = <1>;
@@ -1464,17 +1665,85 @@
 			resets = <&ccu RST_BUS_HDMI>;
 			reset-names = "phy";
 			#phy-cells = <0>;
-			status = "okay";
+			status = "disabled";
 		};
 
 		hdmi_connector: hdmi-connector {
 			compatible = "hdmi-connector";
 			type = "a";
+			status = "disabled";
 			port {
 				hdmi_con_in: endpoint {
 					remote-endpoint = <&hdmi_out>;
 				};
 			};
+		};
+
+		/*
+		 * HDMI-RX (HY310 ingress path).
+		 *
+		 * Custom H713 controller — register-compatible with the Synopsys
+		 * DesignWare HDMI-RX block at the controller side, but with a
+		 * H713-specific PHY at 0x05040000 (5-phase init from stock display.bin
+		 * offset 0x130030, 123 entries / 114 writes).
+		 *
+		 * MMIO regions:
+		 *   "rx"      0x05000000+0x10000  HDMI-RX controller
+		 *   "phy"     0x05040000+0x01000  H713 custom PHY (note: H6 HDMI-TX-PHY
+		 *                                 at offset 0x300 within this region;
+		 *                                 hdmi_phy@5040300 above is disabled to
+		 *                                 avoid MMIO overlap)
+		 *   "thdmirx" 0x050c0000+0x10000  THDMIRX = DDC/EDID-RAM/HDCP. EDID-write
+		 *                                 path uses DMA_CONFIG10 (0x4424) +
+		 *                                 DMA_CONFIG11 (0x4428) here.
+		 *
+		 * Clocks: "bus" + "mod" both pinned to CLK_BUS_DISP for now. Stock
+		 * vmlinux RE shows H713 only has bus-disp (0xdd8 BIT(0)),
+		 * bus-tvcap (0xd88 BIT(0)) and bus-hdmi-audio (0xd80 BIT(0)) as
+		 * verified TV-system gates. The driver does devm_clk_get_enabled()
+		 * for both names — supplying CLK_BUS_DISP twice satisfies refcount
+		 * without driving phantom HDMI-TX gates. "tmds" is optional.
+		 *
+		 * Resets: "ctrl" + "phy" both via RST_BUS_DISP (verified at 0xdd8
+		 * BIT(16)). RST_BUS_HDMI/RST_BUS_HDMI_SUB are H6-carry-overs; using
+		 * them would assert/deassert phantom register bits.
+		 *
+		 * IRQ 65 = GIC_SPI for HDMI-RX HPD/format-change.
+		 *
+		 * Driver lives at drivers/gpu/drm/sun50i-h713/sun50i-h713-hdmi-rx.c
+		 * gated by CONFIG_DRM_SUN50I_H713_HDMI_RX=y in hy310_defconfig.
+		 * The probe pre-loads the EDID-RAM from /lib/firmware/hy310-edid.bin
+		 * and brings up the controller in MAIN+AVPUNIT mode (DDC + HPD live;
+		 * full TMDS path waits until a DRM consumer attaches).
+		 */
+		hdmi_rx: hdmi-rx@5000000 {
+			compatible = "allwinner,sun50i-h713-hdmi-rx";
+			reg = <0x05000000 0x10000>,
+			      <0x05040000 0x01000>,
+			      <0x050c0000 0x10000>;
+			reg-names = "rx", "phy", "thdmirx";
+			interrupts = <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&ccu CLK_BUS_DISP>,
+				 <&ccu CLK_BUS_DISP>;
+			clock-names = "bus", "mod";
+			/*
+			 * No "resets" property: bus-disp is shared with
+			 * h713-drm/sunxi-tvtop/decd which all take it as
+			 * _exclusive. Adding any reset request from this
+			 * driver — exclusive OR shared — would mutex-conflict
+			 * with their probes (both built-in HDMI-RX-driver and
+			 * out-of-tree h713_drm modules want the same line).
+			 *
+			 * U-Boot already deasserts bus-disp before kernel
+			 * hand-off, and our enable path (controller_enable()
+			 * → THDMIRX_GLOBAL_SWRESET_REQUEST) drives the
+			 * internal soft-reset directly via MMIO. The driver
+			 * code keeps reset_control_get_optional_* calls so a
+			 * future SoC variant that exposes a dedicated reset
+			 * can wire one in via DTS without code changes.
+			 */
+			power-domains = <&pmu_ctrl 2>;	/* pd_tvcap */
+			status = "okay";
 		};
 
 		/*
