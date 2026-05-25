@@ -1,127 +1,163 @@
-# Building the HY310 Mainline Kernel
+# Building the HY310 Kernel
 
 ## Prerequisites
 
-- ARM cross-compiler: `arm-linux-gnueabi-gcc` (Debian: `apt install gcc-arm-linux-gnueabi`)
+- ARM cross-compiler: `arm-linux-gnueabi-gcc`
+  (Debian: `apt install gcc-arm-linux-gnueabi`)
 - Standard kernel build tools: `make`, `bc`, `flex`, `bison`, `libssl-dev`
-- Device tree compiler: built automatically with the kernel
-- Python 3: for `repack_boot.py`
+- Python 3 for `repack_boot.py`
 
-## Important Build Settings
+## Important build settings
 
-- **MIPS IPC**: `CONFIG_SUNXI_MIPSLOADER=y` must be set (built-in, not module)
-  for ARM-MIPS shared memory IPC to work. Without it, MIPS never receives the
-  SharedMem address and cannot reach APP_READY.
-- **Cross-compile**: `ARCH=arm CROSS_COMPILE=arm-linux-gnueabi-` with `-j2`
-  recommended on memory-constrained build hosts (`JOBS=2`).
+- **MIPS IPC**: `CONFIG_SUNXI_MIPSLOADER=y` must be set (built-in, not module).
+  Without it, MIPS never receives the SharedMem address and cannot reach
+  APP_READY.
+- **Cross-compile**: `ARCH=arm CROSS_COMPILE=arm-linux-gnueabi-`.
+- **Memory-constrained build hosts**: pass `-j2` (the script uses `JOBS=2` by
+  default).
 
-## Overview
+## Two build paths
 
-This repo uses a **commit-based workflow** — the kernel source tree already
-contains all HY310 changes. You do **not** need to apply patches unless you're
-working with a fresh vanilla kernel tree.
+### A. From this repo (recommended)
 
-### Option A: Build from this repo (recommended)
+The kernel source tree already contains all HY310 changes. You don't need to
+apply patches.
 
-```bash
+```sh
 cd hy310-linux
-# Kernel source already includes all changes — no patch application needed
+export KDIR=/path/to/linux-6.16.7   # vanilla kernel tarball expanded here
+./scripts/build_kernel_arm32.sh
 ```
 
-### Option B: Apply patches to a fresh vanilla tree (optional)
+### B. Apply patches to a fresh vanilla tree
 
-If you have a vanilla `linux-6.16.7` tree and want to apply the HY310 patches:
+If you have a clean `linux-6.16.7` and want to apply the HY310 patches
+manually:
 
-```bash
+```sh
 cd linux-6.16.7
 for p in $(cat /path/to/hy310-linux/patches/series); do
     patch -p1 < /path/to/hy310-linux/patches/$p
 done
 ```
 
-## Quick Build (End-to-End)
+The patch set is 8 patches:
 
-The `scripts/build_kernel_arm32.sh` script handles the entire pipeline:
-defconfig → zImage → DTBs → modules → Android Boot v3 image (4MB chunks).
+```
+0001-clk-sunxi-ng-add-h713-ccu-driver.patch
+0002-pinctrl-sunxi-add-h713-pio-driver.patch
+0003-pinctrl-sunxi-add-h713-r-pio-driver.patch
+0004-pinctrl-sunxi-fix-irq-mux-and-graceful-resource.patch
+0005-phy-sun4i-usb-add-h713-pmu-bit0-quirk.patch
+0006-mmc-sunxi-add-h713-v5p3x-support.patch
+0007-pwm-add-sun8i-8channel-driver.patch
+0008-misc-add-hy310-board-mgr.patch
+```
 
-```bash
-# Set paths (defaults shown)
-export KDIR=/path/to/linux-6.16.7          # vanilla or patched kernel tree
-export OUTDIR=./output_arm32                # build output directory
-export ROOTFS=/path/to/debian-armhf         # optional: modules install target
+## Quick build (end-to-end)
+
+```sh
+export KDIR=/path/to/linux-6.16.7
+export OUTDIR=./output_arm32                # build output (defaults work)
+export ROOTFS=/path/to/debian-armhf         # optional: install modules here
 
 ./scripts/build_kernel_arm32.sh
 ```
 
 This produces in `$OUTDIR/`:
-- `zImage` — compressed kernel image
+
+- `zImage` — compressed kernel
 - `sun50i-h713-hy310.dtb` — device tree blob
-- `hy310-mainline-arm32-boot.img` — Android Boot v3 image
-- `mboot32.00`, `mboot32.01` — 4MB chunks for U-Boot fatload
+- `hy310-mainline-arm32-boot.img` — Android Boot v3 image (for `dd` to eMMC)
+- `mboot32.00`, `mboot32.01` — 4 MB chunks (for U-Boot fatload from FAT
+  partition)
 - Kernel modules (installed to `$ROOTFS` if it exists)
 
-## Manual Build Steps
+## Manual build steps
 
-### Step 1: Configure
+### 1. Configure
 
-```bash
-cp /path/to/hy310-linux/config/hy310_defconfig arch/arm/configs/
+```sh
+cp config/hy310_defconfig $KDIR/arch/arm/configs/
+cd $KDIR
 make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- hy310_defconfig
 make olddefconfig
 ```
 
-### Step 2: Build Kernel + In-Tree Modules
+### 2. Build kernel + in-tree modules
 
-```bash
+```sh
 make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- -j$(nproc) zImage modules dtbs
 ```
 
-### Step 3: Build Out-of-Tree Modules
+### 3. Build out-of-tree modules
 
-```bash
-export KDIR=/path/to/linux-6.16.7
-./scripts/build_modules.sh
+The build script handles this, but if you do it manually you need
+`KBUILD_EXTRA_SYMBOLS` to chain dependent modules. Order matters: `tvtop`
+exports symbols that `ge2d`, `decd`, and `cpu_comm` consume.
+
+```sh
+# 1. TVTOP (no dependencies)
+make -C $KDIR M=$PWD/drivers/tvtop \
+    ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- modules
+
+# 2. Modules that depend on tvtop (decd, ge2d, drm shim)
+KBUILD_EXTRA_SYMBOLS=$PWD/drivers/tvtop/Module.symvers \
+make -C $KDIR M=$PWD/drivers/decd \
+    ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- modules
+
+KBUILD_EXTRA_SYMBOLS=$PWD/drivers/tvtop/Module.symvers \
+make -C $KDIR M=$PWD/drivers/display/ge2d \
+    ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- modules
+
+KBUILD_EXTRA_SYMBOLS=$PWD/drivers/tvtop/Module.symvers \
+make -C $KDIR M=$PWD/drivers/display/drm \
+    ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- modules
+
+# 3. Independent modules
+make -C $KDIR M=$PWD/drivers/cpu_comm \
+    ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- modules
+
+make -C $KDIR M=$PWD/drivers/audio \
+    ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- modules
+
+# 4. Wi-Fi + BT
+make -C $KDIR M=$PWD/drivers/wifi \
+    ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- modules
 ```
 
-This builds all out-of-tree modules in dependency order:
-1. TVTOP (display bus fabric)
-2. DECD (video decoder)
-3. CPU_COMM (ARM↔MIPS IPC)
-4. Audio (codec + cpudai + machine)
-5. Audio bridge (TridentALSA)
-6. GE2D (legacy display, depends on TVTOP)
-7. WiFi AIC8800 (bsp + fdrv + btlpm)
+> **Anti-pattern**: appending one module's `Module.symvers` to the kernel's
+> `Module.symvers` (e.g. `cat tvtop/Module.symvers >> kernel/Module.symvers`)
+> pollutes the kernel symbol table and breaks reproducibility. Always use
+> `KBUILD_EXTRA_SYMBOLS`.
 
-Or build individually:
-```bash
-make -C $KDIR M=$PWD/drivers/tvtop ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- modules
-```
+### 4. Build the boot image
 
-### Step 4: Build Device Tree
+`repack_boot.py` is required — it appends the DTB to zImage, wraps in
+Android Boot v3 header, and splits into 4 MB chunks for U-Boot fatload.
 
-```bash
-# Canonical DTB build script (v8):
-build_h713_dtb_v8.sh
-```
-
-> **Note:** `build_h713_dtb_v8.sh` is the only correct DTB build script.
-> Legacy scripts (`build_dtb.sh`, `build_h713_dtb_v7.sh`) are deprecated.
-
-### Step 5: Create Boot Image
-
-```bash
+```sh
 python3 scripts/repack_boot.py \
-    --zimage arch/arm/boot/zImage \
-    --dtb output_arm32/sun50i-h713-hy310-v7.dtb
+    --outdir output_arm32/ \
+    --zimage output_arm32/zImage \
+    --dtb output_arm32/sun50i-h713-hy310.dtb \
+    --cmdline "console=tty0 console=ttyS0,115200 earlycon loglevel=8 \
+               root=/dev/sda2 rootwait rootfstype=ext4 net.ifnames=0 \
+               panic=5 clk_ignore_unused pd_ignore_unused \
+               hy310_board_mgr.no_rpm_shutdown=1 cma=128M"
 ```
 
-### Step 6: Install Modules to Staging
+> **Why this is mandatory**: an inline Python `make boot.img` skips the DTB
+> append and produces a brick. Always go through `repack_boot.py`.
 
-```bash
+### 5. Install modules
+
+```sh
 ./scripts/install_modules.sh . ./staging
 ```
 
 ## Next
 
-See [FLASHING.md](FLASHING.md) for how to flash the boot image to the HY310.
-See [ROOTFS.md](ROOTFS.md) for how to create a Debian rootfs.
+- [FLASHING.md](FLASHING.md) — flash the image to eMMC or boot from USB.
+- [ROOTFS.md](ROOTFS.md) — create a Debian rootfs with the modules
+  pre-installed.

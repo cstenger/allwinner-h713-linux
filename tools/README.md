@@ -1,83 +1,122 @@
-# Debug and Analysis Tools
+# Debug and analysis tools
 
-## uboot_interrupt.py
+Most of these scripts target the development workflow (host + device).
+Many can be run on the HY310 directly.
 
-U-Boot recovery tool. Connects to HY310 UART via OrangePi TCP bridge
-(192.168.8.179:9999) and sends rapid keypresses to interrupt the 5-second
-bootdelay.
+## U-Boot recovery
 
-```bash
-python3 tools/uboot_interrupt.py --boot-usb   # Boot from USB stick (rescue)
-python3 tools/uboot_interrupt.py --restore     # Restore boot_a from boot_b
-python3 tools/uboot_interrupt.py --cmd "..."   # Custom U-Boot command
-python3 tools/uboot_interrupt.py --monitor     # Watch UART output only
-python3 tools/uboot_interrupt.py               # Drop to U-Boot prompt
+### `uboot_interrupt.py`
+
+Connects to HY310 UART (via OrangePi TCP bridge at `192.168.8.179:9999`)
+and sends rapid keypresses to interrupt U-Boot's `bootdelay=5` window.
+
+```sh
+python3 tools/uboot_interrupt.py                # drop to U-Boot prompt
+python3 tools/uboot_interrupt.py --boot-usb     # USB-stick rescue boot
+python3 tools/uboot_interrupt.py --restore      # restore boot_a from boot_b
+python3 tools/uboot_interrupt.py --cmd "..."    # custom U-Boot command
+python3 tools/uboot_interrupt.py --monitor      # watch UART output only
 ```
 
-## dump_mips_elog.py
+**Note**: stock U-Boot has `bootdelay=0` by default — patch the env
+first with [sunxi-env-patcher](https://github.com/well0nez/sunxi-env-patcher)
+to add `bootdelay=5`. Otherwise no interrupt window exists.
 
-Reads the MIPS co-processor error log from shared memory. The elog is a
-ring buffer at physical address 0x4B272D9C (100KB), Mode 1 (ring buffer).
+## Boot image validation
 
-```bash
-# Run on HY310 target:
-python3 dump_mips_elog.py
-```
+### `verify_bootimg.py`
 
-## verify_bootimg.py
+Validates Android Boot v3 image: checks `ANDROID!` magic, header fields,
+kernel/ramdisk offsets, page alignment.
 
-Validates an Android Boot v3 image: checks ANDROID! magic, header fields,
-kernel/ramdisk offsets, and page alignment.
-
-```bash
+```sh
 python3 tools/verify_bootimg.py output/hy310-mainline-arm32-boot.img
 ```
 
-## compare_dtb.py
+### `compare_dtb.py`
 
-Compares two DTB files by decompiling both and diffing the DTS output.
-Useful for verifying that a rebuilt DTB matches the production DTB.
+Compares two DTB files by decompiling both and diffing the DTS. Useful
+for verifying that a rebuilt DTB matches the production DTB.
 
-```bash
+```sh
 python3 tools/compare_dtb.py old.dtb new.dtb
 ```
 
-## analyze_env.py
+## U-Boot environment
 
-Analyzes and dumps U-Boot env_a partition content. Parses the CRC32 header,
-shows all environment variables, and validates checksum integrity.
+### `analyze_env.py`
 
-```bash
+Dumps U-Boot `env_a` content. Parses CRC32 header, shows all environment
+variables, validates checksum.
+
+```sh
 python3 tools/analyze_env.py /path/to/env_a.bin
 ```
 
-## patch_env_usb.py
+### `patch_env_usb.py`
 
-Patches the U-Boot env_a partition to add `usb start` to bootcmd.
-See also: https://github.com/well0nez/sunxi-env-patcher
-Handles the CRC32 checksum correctly. See [FLASHING.md](../FLASHING.md).
+Adds `usb start` to bootcmd. Handles CRC32 correctly. See
+[FLASHING.md](../FLASHING.md) for context.
 
-```bash
+```sh
 python3 tools/patch_env_usb.py
 ```
 
-## probe_wdt.py
+A cleaner version with more features is at
+[sunxi-env-patcher](https://github.com/well0nez/sunxi-env-patcher).
 
-Probes watchdog registers via /dev/mem. Used to discover that the H713
-watchdog is at 0x02051000 (NOT the H6 address 0x030090a0).
+## MIPS firmware
 
-```bash
-# Run on HY310 target:
+### `dump_mips_elog.py`
+
+Reads the MIPS coprocessor error log from shared memory. The elog is a
+ring buffer at ARM-phys `0x4B272D9C` (~120 KB), Mode 1.
+
+Run on the device:
+
+```sh
+python3 dump_mips_elog.py
+```
+
+Mode 2 (2 MB linear) tools are on the device at
+`/root/mips_elog2.py` + `/root/unscramble_elog.py`.
+
+## Hardware probing
+
+### `probe_wdt.py`
+
+Probes watchdog registers via `/dev/mem`. Originally used to discover
+that H713 WDT is at `0x02051000` (not the H6 address `0x030090a0`).
+
+```sh
+# Run on device:
 python3 probe_wdt.py
 ```
 
-## read_rpio.py
+### `read_rpio.py`
 
-Reads R_PIO (PL/PM bank) register values via /dev/mem. Useful for debugging
-GPIO pin function and pull-up configuration on the H713 R_PIO controller
-(0x30 byte bank spacing, NOT 0x24).
+Reads R_PIO (PL / PM bank) registers via `/dev/mem`. For debugging
+GPIO pin function and pull-up on the H713 R_PIO controller (which uses
+0x30 byte bank spacing, NOT 0x24 like H6).
 
-```bash
-# Run on HY310 target:
+```sh
+# Run on device:
 python3 read_rpio.py
 ```
+
+## RE workflow (extra)
+
+For deeper RE work see [docs/contributing-re.md](../docs/contributing-re.md)
+which covers:
+
+- IDA Pro / Ghidra / capstone-elftools setup
+- `hreg` / `hdump` universal MMIO/DRAM accessors via `/dev/hidtvreg`
+- `regtrace` periodic register-diff
+- display.bin patching workflow
+- Stock-Android live-comparison via ADB + magisk
+
+## See also
+
+- [BUILDING.md](../BUILDING.md) — build pipeline
+- [FLASHING.md](../FLASHING.md) — flashing procedures
+- [docs/contributing-re.md](../docs/contributing-re.md) — RE workflow

@@ -1,92 +1,135 @@
-# HY310 Mainline Linux Port — Status
+# Subsystem Status
 
-> Last updated: 2026-04-14
+> **Alpha.** Honest snapshot, updated 2026-05-25. "Working" means verified
+> on hardware, not "compiles".
 
-## Subsystem Status Overview
+## TL;DR
+
+- ✅ ARM userland, networking, IPC, audio, thermals, eMMC, USB, Wi-Fi, BT: **working**
+- ✅ ARM↔MIPS IPC + callback delivery + signal detection: **working**
+- ⚠️ HDMI input picture: **broken** (4×1 XRGB grayscale tiling on the projector)
+- ⚠️ GPU + video decoding: **disabled** in current build
+- ⚠️ Wayland desktop: **off** — current build routes the display through
+  the HDMI-RX scanout path (which is what we're debugging), not through a
+  compositor
+- **No HDMI output port exists** on the HY310. Only HDMI input. The DLP
+  projector itself is the only display output.
+
+## Subsystem table
 
 | Subsystem | Status | Driver | Notes |
-|-----------|--------|--------|-------|
-| **Boot** | Working | Stock U-Boot + patched env | Android Boot v3, cmdline in DTS |
-| **Serial Console** | Working | 8250_dw | ttyS0 @ 115200 |
-| **eMMC** | Working | sunxi-mmc (patched) | HS400 @ 200MHz DDR, 103 MB/s, 7.3GB |
-| **USB** | Working | ehci/ohci + phy-sun4i-usb (patched) | 3x EHCI + 3x OHCI |
-| **WiFi** | Working | aic8800_bsp + aic8800_fdrv (out-of-tree) | AIC8800D80 SDIO, stable |
-| **Bluetooth** | Working | hci_uart H4 + aic8800_btlpm | Auto-start via systemd, 1.5Mbaud flow control |
-| **IR Remote** | Working | sunxi-cir + rc-core decoders | NEC/RC5/RC6, /dev/lirc0, PL9 mux 3 (IDA-verified) |
-| **RTC** | Working | sun6i-rtc | @ 0x07090000 |
-| **Thermal** | Working | sun8i-thermal | 2 zones (CPU ~65C, GPU ~66C) |
-| **I2C** | Working | mv64xxx | TWI1, STK8BA58 accelerometer |
-| **PWM** | Working | pwm-sun8i (new driver) | 8 channels |
-| **Fan Control** | Working | hy310-board-mgr | PWM fan + tachometer + NTC |
-| **Watchdog** | Working | sunxi-wdt | @ 0x02051000 |
-| **Reboot** | Working | sunxi-wdt | via watchdog reset |
-| **Poweroff** | Working | — | Confirmed functional |
-| **Keystone Motor** | Untested | hy310-keystone-motor | Sysfs works, limit switch defective on test unit |
-| **Audio** | Working | codec + cpudai + machine (out-of-tree) | Speaker output, digital volume control, auto-start at boot |
-| **Display (DRM/KMS)** | Working | h713_drm (out-of-tree) | DRM/GEM scanout, PRIME, Labwc desktop runs |
-| **Video Decode (Cedrus)** | Working | sunxi-cedrus (patched, module) | H.264/H.265/MPEG2/VP8 HW decode, V4L2 stateless API |
-| **Display (legacy)** | Working | ge2d + tvtop (out-of-tree) | Stock display pipeline, MIPS-initialized |
-| **ARM-MIPS IPC** | Working | cpu_comm (out-of-tree) | ARM=0x5 MIPS=0x5, autonomous handshake |
-| **MIPS Coprocessor** | Working | sunxi-mipsloader (built-in) | APP_READY=0x5 autonomous, elog ring buffer at 0x4B272D9C |
-| **HDMI** | In Progress | dw-hdmi (DTS only) | DTS nodes in place, driver integration pending |
-| **GPU** | Working | panfrost + sun50i-h713-ppu | Mali-G31 864MHz, card0/renderD128, PRIME to h713_drm |
-| **IOMMU** | Working (provider only) | sun50i-iommu (built-in) | Provider at 0x030f0000, no consumers attached yet |
-| **GPADC** | Working | sun20i-gpadc (IIO) | 2 ADC channels via /sys/bus/iio/ |
-| **LRADC** | Working | sun50i-h713-lradc (IIO, built-in) | NTC temp sensing for board-mgr via IIO consumer |
-| **LRADC Keyboard** | Unclear | — | @ 0x02009800, 6 keys + power |
-| **SPI** | N/A | — | No devices connected on HY310 |
-| **Crypto Engine** | Working | sun8i-ce (built-in) | HW AES/SHA, 33 algorithms registered |
-| **HW Spinlock** | Working | sun6i-hwspinlock (built-in) | Used by cpu_comm for ARM↔MIPS sync |
+|---|---|---|---|
+| Boot | ✅ works | stock U-Boot + patched env | Android boot v3, cmdline in DTS |
+| Serial console | ✅ works | `8250_dw` | `ttyS0 @ 115200` |
+| eMMC | ✅ works | `sunxi-mmc` patched | **HS200 @ 200 MHz SDR**, ~50 MB/s. Was HS400; downgraded after second board misbehaved |
+| USB | ✅ works | ehci/ohci + `phy-sun4i-usb` patched | 3× EHCI + 3× OHCI, needs PMU bit-0 quirk |
+| Wi-Fi | ✅ works | `aic8800_bsp` + `aic8800_fdrv` OOT | AIC8800D80 SDIO, stable |
+| Bluetooth | ✅ works | `hci_uart` H4 + `aic8800_btlpm` | UART1, 1.5 Mbaud, flow control |
+| IR remote | ⚠️ partial | `sunxi-cir` + rc-core | NEC decoder flaky (R_CCU prescaler mismatch). lircd raw works |
+| RTC | ✅ works | `sun6i-rtc` | @ 0x07090000 |
+| Thermal | ✅ works | `sun8i-thermal` | 2 zones (CPU ~65 °C, GPU ~66 °C) |
+| I2C | ✅ works | `mv64xxx` | TWI1, STK8BA58 detected |
+| PWM | ✅ works | `pwm-sun8i` (new driver) | 8 channels |
+| Fan | ✅ works | `hy310-board-mgr` | PWM + tachometer (hrtimer polling) + NTC |
+| Watchdog | ✅ works | `sunxi-wdt` | @ 0x02051000 |
+| Reboot / poweroff | ✅ works | — | verified |
+| Keystone motor | ⚠️ untested | `hy310-keystone-motor` | sysfs works, limit switch defective on test unit |
+| Audio | ✅ works | codec + cpudai + machine OOT | Speaker output + digital volume, no HDMI audio |
+| **ARM↔MIPS IPC** | ✅ works | `cpu_comm` OOT | Full bidirectional, callback-delivery via `.read`/`.poll` patch |
+| **MIPS coprocessor** | ✅ works | `sunxi-mipsloader` (built-in) | APP_READY=0x5, all 81 routines registered, state machine 1→5 (Running) |
+| **HDMI-RX signal detection** | ✅ works | MIPS firmware + `hy310-hdmird` | 1080p60 detected, signal callbacks fire on ARM |
+| **HDMI-RX picture quality** | ❌ broken | `h713_drm` + `mips_scanout_addr` override | Shows on projector as **4×1 XRGB grayscale tiling**. Channel format mismatch. Next: swap to `sunxi_ge2d`. |
+| **DLP projector output (LVDS)** | ⚠️ broken picture | `h713_drm` ch1 XRGB hack | The only output the device has. Currently shows the broken HDMI-RX content. |
+| GPU | ⚠️ disabled | `panfrost` (built but not loaded) | Worked previously; off while debugging display pipeline |
+| Wayland desktop | ⚠️ off | Labwc + Panfrost | Output is currently routed to the HDMI-RX scanout path, not a compositor |
+| Video decode (Cedrus) | ⚠️ disabled | `sunxi-cedrus` (built but not loaded) | Same as GPU |
+| IOMMU | ⚠️ provider only | `sun50i-iommu` (built-in) | Runs; no consumer attached |
+| GPADC | ✅ works | `sun20i-gpadc` IIO | 2 channels |
+| LRADC | ✅ works | `sun50i-h713-lradc` IIO | NTC temp sensing |
+| LRADC keyboard | ❓ unclear | — | 6 keys + power, but ADC stays at 63 — wiring unclear |
+| Crypto engine | ✅ works | `sun8i-ce` (built-in) | 33 algorithms |
+| HW spinlock | ✅ works | `sun6i-hwspinlock` (built-in) | Used by `cpu_comm` |
 
-## Display Pipeline (DRM/KMS) — New
+## Why some things are off right now
 
-The H713 uses a custom display pipeline (NOT standard Allwinner DE2/DE3/TCON):
+### Current output routing — projector via HDMI-RX path
 
+The HY310's only display output is the DLP projector via LVDS. We have
+**no HDMI output port** on the device.
+
+Right now the projector shows what comes through the HDMI-RX path: 4×1
+grayscale tiling because AFBD channel-1 is in XRGB (32 bpp) mode while
+MIPS writes NV12 (12 bpp) into the buffer. Every row's 1920 NV12-Y bytes
+get interpreted as 480 XRGB pixels, then tiled 4× to fill the row.
+Chroma is ignored → grayscale.
+
+Wayland desktop is intentionally **off** in the current build. Until the
+HDMI-RX scanout is producing a clean picture, running a compositor on
+top doesn't make sense.
+
+### h713_drm — minimal scanout shim
+
+`h713_drm` is a thin DRM/KMS driver that hacks the AFBD scanout pointer
+to point at MIPS's output buffer (via `mips_scanout_addr=0x4c3ef000`).
+With it loaded you get the broken 4×1 picture. Without it: no picture
+on the projector at all.
+
+The right driver is `sunxi_ge2d` (3000-line port already in the repo at
+`drivers/display/ge2d/`), which is blacklisted because of a DT-binding
+conflict — we picked the wrong one. Next step: swap the blacklist. See
+[docs/subsystems/display.md](docs/subsystems/display.md).
+
+### Wayland + Panfrost + Cedrus
+
+These all worked previously. They're temporarily off while we debug the
+HDMI-RX path — the GPU was using the display pipeline aggressively and
+made register-state diffs unreadable. The plan is to re-enable them
+after `sunxi_ge2d` is active and the HDMI-RX path is clean.
+
+### eMMC HS400 → HS200
+
+The first device handled HS400 fine. A second device showed intermittent
+CRC errors and rare hangs at HS400. We downgraded the DTS to HS200 for
+portability across boards. See
+[docs/subsystems/emmc.md](docs/subsystems/emmc.md).
+
+## Verifying a fresh build
+
+```sh
+# ARM userland up
+ssh hy310 'uname -a; uptime'
+
+# IPC working
+ssh hy310 '/usr/local/bin/test_brightness_call'
+
+# MIPS up and running
+ssh hy310 'cat /sys/class/hy300/mips/state_machine'   # expect 5 (Running)
+
+# HDMI-RX signal detection
+ssh hy310 'systemctl status hy310-hdmird; journalctl -u hy310-hdmird -n 30'
+
+# Display output: look at the projector. Expect 4×1 grayscale of HDMI source.
 ```
-TVTOP (bus fabric) -> VBlender (timing) -> OSD (plane) -> AFBD -> LVDS -> DLPC3435 -> DLP
-```
 
-**Root cause of initial VBlender-reads-zero problem**: TVTOP bus fabric routing
-registers at 0x05700000 must be programmed before any display sub-blocks respond.
-See [docs/DISPLAY_BRINGUP.md](docs/DISPLAY_BRINGUP.md).
+## Open issues (highlights)
 
-**Current DRM driver** (`drivers/display/drm/h713_drm.c`):
-- Out-of-tree module, binds to `trix,ge2d` compatible
-- `drm_simple_display_pipe` with fixed 1920x1080@60 LVDS mode
-- GEM DMA scanout via AFBD controller (scanout addr at AFBD_CTRL+0x78)
-- Warm-disable strategy (clocks kept alive, MIPS owns timing/PHY init)
-- PRIME buffer sharing with Panfrost verified (bidirectional roundtrip)
-- Weston launches with GL renderer (Panfrost), LVDS output enabled
-- **Blocker**: CMA pool too small for Weston buffer allocation (ENOMEM on CREATE_DUMB)
+Full list: [docs/known-issues.md](docs/known-issues.md). Highlights:
 
-## Known Issues
+- HDMI-RX picture quality: 4×1 XRGB grayscale tiling. Path forward:
+  `sunxi_ge2d` swap.
+- IR remote NEC decoder: unreliable due to R_CCU prescaler. Use lircd raw.
+- Msgbox TX reliability: 40-60% (edge-trigger H713). Pulse-doorbell workaround.
+- HPD plug/unplug: not auto-detected (IRQ 266 silent). Polling planned.
+- EDID DMA readback: zero but functionally works. Mechanically not understood.
 
-- **IR Remote: NEC kernel decoder unreliable** — LIRC raw data is correct but
-  the kernel NEC decoder does not reliably match timings. Root cause: the stock
-  H713 IR driver uses 3 R_CCU clocks (bus/pclk/mclk) with clk_set_parent 
-  which configures a different prescaler than our D1-based R_CCU (2 clocks only).
-  This makes rx_resolution ~25% off. Fix requires adding H713-specific clock
-  indices to the R_CCU driver or implementing the 3-clock setup in sunxi-cir.
-  Workaround: use lircd with raw timing config for remote control decoding.
+## Not started
 
-- **MIPS IPC: Msgbox IRQ blocked** — ARM can send to MIPS (Msgbox TX works,
-  MIPS reads FIFO), but MIPS cannot interrupt ARM because HW IRQ 25 at the MIPS
-  INTC never asserts despite Msgbox IRQ status being pending. This is the
-  fundamental blocker for bidirectional ARM-MIPS communication.
-  See [docs/CPU_COMM.md](docs/CPU_COMM.md).
+- TVCAP/INCAP frame-capture pipeline (skeleton exists in `sunxi_tvcap_rx.ko`)
+- LRADC physical keyboard
+- HDMI audio
 
+## How to contribute
 
-
-- **Motor** — Position tracking works via sysfs, but physical movement after
-  boot homing is inconsistent. Limit switch (PH14) always reads LOW.
-
-## Build Verification
-
-This repository has been tested with the following workflow:
-1. Fresh vanilla linux-6.16.7 extracted from tarball
-2. All patches applied cleanly (0 failures)
-3. Kernel zImage built successfully (4m52s)
-4. 20 in-tree kernel modules built
-5. All out-of-tree modules built (audio 3x, bridge, ge2d, wifi 3x, h713_drm)
-6. DTB from standalone DTS is SHA256-identical to production DTB
-7. H713 DRM regression gates pass (reopen, reload, modetest, PRIME)
+See [docs/contributing-re.md](docs/contributing-re.md) for RE workflow,
+tools (IDA, capstone, `hreg`/`hdump`), and which problems are currently
+actionable.
