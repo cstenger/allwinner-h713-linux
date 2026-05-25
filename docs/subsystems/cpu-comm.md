@@ -72,7 +72,11 @@ Full list: about 80-85 routines registered at MIPS boot. See
 
 ## Kernel module
 
-**Source**: `drivers/cpu_comm/` (8 source files)
+**Source**: `drivers/soc/sunxi/cpu_comm/` (8 source files) — built **in-tree** as
+a module (`CONFIG_HY310_CPU_COMM=m`), added by
+`patches/0024-soc-sunxi-add-cpu-comm-and-msgbox-ipc.patch`. Its mailbox RPMSG
+transport `drivers/soc/sunxi/msgbox/` (`SUNXI_MSGBOX_AMP=y`) ships in the same
+patch.
 **Output**: `hy310-cpu-comm.ko`
 **DTS**: `cpu-comm` with `compatible = "allwinner,sunxi-cpu-comm", "trix,cpu_comm"`
 
