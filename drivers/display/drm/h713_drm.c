@@ -52,7 +52,7 @@
 #define H713_AFBD_CTRL_BASE	0x05600100
 #define H713_AFBD_CTRL_SIZE	0x80
 #define H713_AFBD_BASE		0x05600000
-#define H713_AFBD_BASE_SIZE	0x20
+#define H713_AFBD_BASE_SIZE	0x400	/* covers ctrl + channels + global regs */
 
 #define H713_GE2D_CORE_BASE	0x05240000
 #define H713_GE2D_CORE_SIZE	0x20
@@ -82,17 +82,160 @@ module_param_named(enable_dlpc3435, h713_enable_dlpc3435, bool, 0644);
 MODULE_PARM_DESC(enable_dlpc3435,
 	"Enable experimental DLPC3435 I2C init sequence during display enable");
 
+static ulong h713_mips_scanout_addr;
+module_param_named(mips_scanout_addr, h713_mips_scanout_addr, ulong, 0644);
+MODULE_PARM_DESC(mips_scanout_addr,
+	"NV12 Y-plane phys addr from MIPS firmware (0=disabled, e.g. 0x4c3ef000)");
+
+/* Default NV12 chroma offset = stock-android (0x4c9ec000 - 0x4c3ef000) */
+static ulong h713_mips_scanout_c_offset = 0x5fd000;
+module_param_named(mips_scanout_c_offset, h713_mips_scanout_c_offset, ulong, 0644);
+MODULE_PARM_DESC(mips_scanout_c_offset,
+	"NV12 C-plane offset from Y (default 0x5fd000 from stock-android dump)");
+
+/*
+ * ch1_mode: override u-boot's XRGB ch1 config to NV12 for MIPS-output scanout.
+ * 0 = off (keep u-boot XRGB defaults — current behavior, kachelung)
+ * 1 = stride-only fix (+0x70 = 0x780 = 1920) — minimal change
+ * 2 = full NV12 mode (+0x40 ctrl + +0x70 stride1 + +0x74 stride2)
+ * 3 = mode 2 + extended quirks (+0x48/+0x4c/+0x64/+0x68/+0x6c) — TBD werte, falls back to 2
+ *
+ * Toggle live via:
+ *   echo N > /sys/module/h713_drm/parameters/ch1_mode
+ *   systemctl restart labwc   # re-trigger pipe_enable
+ *
+ * BB phase 6 hat direct-mem-write versucht (race mit DRM-commit, regression).
+ * Diese implementation schreibt im pipe_enable-context nach reset+clock-enable,
+ * vor program_frame_geometry — kein race.
+ */
+static uint h713_ch1_mode;
+module_param_named(ch1_mode, h713_ch1_mode, uint, 0644);
+MODULE_PARM_DESC(ch1_mode,
+	"Override ch1 config: 0=off, 1=stride-only, 2=NV12-full, 3=NV12+quirks");
+
+/*
+ * ch0_mode: enable ch0 NV12-scanout (stock-conform).
+ *
+ * Stock-android trace (2026-05-06) zeigt: stock nutzt ch0 NICHT ch1 für visible
+ * NV12-scanout. Stock register-state:
+ *   +0x05600100 ch0_ctrl = 0x83001901  (NV12 active, bit31 + bit0 = enable)
+ *   +0x05600140 ch1_ctrl = 0x83001900  (ch1 disabled, bit0 cleared)
+ *   +0x05600320/+0x324 = MIPS Y/C buffers (page-flip-engine live mit MIPS rotating)
+ *
+ * Mainline state mit ch1_mode=0:
+ *   +0x05600100 ch0_ctrl = 0x00010000  (disabled)
+ *   +0x05600140 ch1_ctrl = 0x03001901  (XRGB active, scanout-source)
+ *
+ * ch0_mode-mode-werte:
+ * 0 = off (= keep mainline u-boot defaults)
+ * 1 = enable ch0 NV12 only (= +0x100 = 0x83001901)
+ * 2 = mode 1 + disable ch1 (= +0x140 = 0x83001900)
+ * 3 = mode 2 + force src_mux bit 14 (= +0x300 = 0x00804258, ch0-active)
+ * 4 = mode 2 + full stock-conform ch0 register init (+0x108/+0x10c/+0x124..+0x12c)
+ *     plus +0x310=0x00a00210 (bit 21 = ch0-active hint?) plus +0x10/+0x14 trigger
+ *
+ * Erwartung: bei ch0_mode=2 sollte hardware-scanout-source von ch1 (XRGB statisch)
+ * zu ch0 (NV12 page-flip mit MIPS-buffers in +0x320/+0x324) wechseln → bild
+ * wird sauber 1080p NV12 statt kachelig.
+ *
+ * Risiko: BB phase 3 hat ch0-direct-write via /dev/mem versucht und war REJECTED.
+ * Diese implementation läuft im pipe_enable-context (= nach reset+clock+TVTOP-routing
+ * sequence). Möglich dass hardware den write hier akzeptiert.
+ */
+static uint h713_ch0_mode;
+module_param_named(ch0_mode, h713_ch0_mode, uint, 0644);
+MODULE_PARM_DESC(ch0_mode,
+	"Enable ch0 NV12-scanout: 0=off, 1=ch0-enable, 2=+ch1-disable, "
+	"3=+force +0x300, 4=+full stock-conform ch0 init+trigger");
+
+/*
+ * TEMPORARY plane-init test — see if writing the stock ge2d_dev.ko plane-init
+ * tables fixes the NV12 stride/format mismatch. If yes, this work moves to the
+ * planned combined h713_display module (Plan A merge). For now: incremental
+ * bitmask param so we can enable each table independently without rebuilding.
+ *
+ *   bit 0 = vblender_writes  (3 regs at 0x05200040..0x05200054)
+ *   bit 1 = osd_writes       (10 regs at 0x05248000..0x0524805c)
+ *   bit 2 = afbd_writes      (6 regs at 0x05600100..0x0560012c)
+ *   bit 3 = vblender bit24 RMW sequence
+ *
+ * Default 0 = no plane-init (= current channel-1 baseline behavior).
+ */
+static uint h713_plane_init_steps;
+module_param_named(plane_init_steps, h713_plane_init_steps, uint, 0644);
+MODULE_PARM_DESC(plane_init_steps,
+	"TEMP test: plane-init bitmask (b0=vblender, b1=osd, b2=afbd, b3=vbl_rmw)");
+
+struct h713_phys_reg_write {
+	u32 addr;
+	u32 value;
+};
+
+/* Verbatim from sunxi_ge2d_osd.c — stock ge2d_dev.ko plane init tables */
+static const struct h713_phys_reg_write h713_plane_vblender_writes[] = {
+	/* PHASE-B fix 2026-05-07: removed wrong stock-RE values.
+	 * Stock has +0x05200040/+0x050/+0x054 = 0 in HDMI-active state.
+	 * Original values matched LVDS +0x14/+0x24/+0x28 (= wrong base+offset).
+	 * See lvds_corrections[] for actual stock-conform values. */
+};
+
+static const struct h713_phys_reg_write h713_plane_osd_writes[] = {
+	{ 0x05248000, 0x80FF0008 },
+	{ 0x05248010, 0x04650098 },
+	{ 0x05248014, 0x00000000 },
+	{ 0x05248050, 0x0000FF00 },
+	{ 0x0524807C, 0x03000140 },
+	{ 0x05248080, 0x02000000 },
+	{ 0x05248004, 0x00100010 },
+	{ 0x05248018, 0x03000000 },
+	{ 0x05248058, 0x01000100 },
+	{ 0x0524805C, 0x00000100 },
+};
+
+static const struct h713_phys_reg_write h713_plane_afbd_writes[] = {
+	{ 0x05600100, 0x83000201 },
+	{ 0x05600108, 0x008000FF },
+	{ 0x0560010C, 0x00FF0080 },
+	{ 0x05600124, 0x00000808 },
+	{ 0x05600128, 0x00000082 },
+	{ 0x0560012C, 0x00000021 },
+};
+
+/*
+ * NOTE on AFBD channel-0 direct write attempts:
+ *
+ * Channel-0 ctrl/format registers (+0x100/+0x108/+0x10c) ARE writable from
+ * kernel. But the source-mux flag (+0x300), global Y/C pointers (+0x320/0x324)
+ * are hardware-protected — kernel writes are silent-rejected. Stock uses a
+ * different mechanism (likely firmware streams via dedicated state-machine
+ * trigger, see sunxi_ge2d_firmware.c which is currently SKIPPED). We use
+ * the channel-1 path (+0x178) which IS writable, with NV12 stride-fix below.
+ */
+
 /* ------------------------------------------------------------------ */
 /* TVTOP bus fabric routing registers (1080p config)                    */
 /* ------------------------------------------------------------------ */
 static const struct { u32 off; u32 val; } tvtop_routing[] = {
 	{ 0x04, 0x00000001 },
 	{ 0x44, 0x11111111 },
-	{ 0x88, 0xFFFFFFFF },
-	{ 0x00, 0x00011111 },
+	{ 0x88, 0x11111111 },
+	{ 0x00, 0xFFF11111 },
 	{ 0x40, 0x00011111 },
 	{ 0x80, 0x00001111 },
 	{ 0x84, 0xFFF000EF },
+};
+
+/* ------------------------------------------------------------------ */
+/* LVDS PHY corrections — override u-boot defaults to stock-conform   */
+/* values. Captured via stock-android adb regdump 2026-05-07 in       */
+/* HDMI-active state. Without these the LVDS pipe transports incorrect*/
+/* bit-formatted data to the panel (= no bild or bunkered).           */
+/* ------------------------------------------------------------------ */
+static const struct { u32 off; u32 val; } lvds_corrections[] = {
+	{ 0x10, 0x00000000 },
+	{ 0x14, 0x1A000005 },
+	{ 0x24, 0x00350000 },
+	{ 0x28, 0x08100035 },
 };
 
 /* ------------------------------------------------------------------ */
@@ -253,6 +396,16 @@ static void h713_tvtop_enable(struct h713_drm *h713)
 	usleep_range(1000, 2000);
 }
 
+static void h713_lvds_apply_corrections(struct h713_drm *h713)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(lvds_corrections); i++)
+		h713_write(h713->lvds, lvds_corrections[i].off,
+			   lvds_corrections[i].val);
+	usleep_range(500, 1000);
+}
+
 static void h713_fill_safe_pattern(struct h713_drm *h713)
 {
 	u32 x, y;
@@ -298,6 +451,9 @@ static dma_addr_t h713_get_scanout_addr(struct h713_drm *h713,
 					struct drm_framebuffer *fb,
 					struct drm_plane_state *state)
 {
+	if (h713_mips_scanout_addr)
+		return (dma_addr_t)h713_mips_scanout_addr;
+
 	if (h713_use_safe_scanout)
 		return H713_UBOOT_SCANOUT_ADDR;
 
@@ -490,6 +646,89 @@ static void h713_program_stream_setup(struct h713_drm *h713)
 	h713_write(h713->ge2d_core, 0x1c, 0x00000300);
 }
 
+/*
+ * Write a phys_addr->value table by mapping each entry to one of our already-
+ * mapped IO regions (vblend / osd / afbd_base). Entries outside known regions
+ * are skipped with a warning.
+ */
+static void h713_write_phys_table(struct h713_drm *h713,
+				  const struct h713_phys_reg_write *table,
+				  size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		u32 addr = table[i].addr;
+		u32 val = table[i].value;
+		void __iomem *base = NULL;
+		u32 off = 0;
+
+		if (addr >= H713_VBLEND_BASE &&
+		    addr < H713_VBLEND_BASE + H713_VBLEND_SIZE) {
+			base = h713->vblend;
+			off = addr - H713_VBLEND_BASE;
+		} else if (addr >= H713_OSD_BASE &&
+			   addr < H713_OSD_BASE + H713_OSD_SIZE) {
+			base = h713->osd;
+			off = addr - H713_OSD_BASE;
+		} else if (addr >= H713_AFBD_BASE &&
+			   addr < H713_AFBD_BASE + H713_AFBD_BASE_SIZE) {
+			base = h713->afbd_base;
+			off = addr - H713_AFBD_BASE;
+		} else {
+			dev_warn(h713->drm.dev,
+				 "plane_init: addr 0x%08x out of mapped range — skipped\n",
+				 addr);
+			continue;
+		}
+
+		dev_info(h713->drm.dev,
+			 "plane_init: 0x%08x = 0x%08x\n", addr, val);
+		h713_write(base, off, val);
+	}
+}
+
+/* VBlender bit24 RMW — port of stock init_osd_plane @ 0x1f50..0x2060 */
+static void h713_run_vblender_bit24_rmw(struct h713_drm *h713)
+{
+	u32 v;
+
+	v = h713_read(h713->vblend, 0x48);
+	h713_write(h713->vblend, 0x3C, v & ~BIT(24));
+	v = h713_read(h713->vblend, 0x48);
+	h713_write(h713->vblend, 0x3C, v | BIT(24));
+	v = h713_read(h713->vblend, 0x48);
+	h713_write(h713->vblend, 0x3C, v & ~BIT(24));
+
+	dev_info(h713->drm.dev, "plane_init: vblender bit24 RMW done\n");
+}
+
+/* TEMP test: incremental plane-init driven by plane_init_steps bitmask */
+static void h713_run_plane_init(struct h713_drm *h713)
+{
+	if (!h713_plane_init_steps)
+		return;
+
+	dev_info(h713->drm.dev,
+		 "plane_init: running steps mask=0x%x\n",
+		 h713_plane_init_steps);
+
+	if (h713_plane_init_steps & BIT(0))
+		h713_write_phys_table(h713, h713_plane_vblender_writes,
+				      ARRAY_SIZE(h713_plane_vblender_writes));
+
+	if (h713_plane_init_steps & BIT(1))
+		h713_write_phys_table(h713, h713_plane_osd_writes,
+				      ARRAY_SIZE(h713_plane_osd_writes));
+
+	if (h713_plane_init_steps & BIT(2))
+		h713_write_phys_table(h713, h713_plane_afbd_writes,
+				      ARRAY_SIZE(h713_plane_afbd_writes));
+
+	if (h713_plane_init_steps & BIT(3))
+		h713_run_vblender_bit24_rmw(h713);
+}
+
 static void h713_program_frame_geometry(struct h713_drm *h713,
 					const struct h713_frame_geometry *geo)
 {
@@ -499,8 +738,11 @@ static void h713_program_frame_geometry(struct h713_drm *h713,
 	 * This avoids partial-frame corruption seen when reprogramming
 	 * SIZE/STRIDE/AFBD geometry in current bring-up state.
 	 */
-	H713_TRACE_WRITE(h713, osd, H713_OSD_BASE, OSD_FB_ADDR,
-			 "OSD_FB_ADDR", (u32)geo->fb_addr);
+	/* PHASE-B fix: stock has OSD_FB_ADDR (+0x05248038) = 0 in HDMI-active.
+	 * The scanout-source for HDMI input is AFBD pool-2 (+0x320/+0x324),
+	 * not the OSD plane. Disabled below to match stock. */
+	/* H713_TRACE_WRITE(h713, osd, H713_OSD_BASE, OSD_FB_ADDR,
+			 "OSD_FB_ADDR", (u32)geo->fb_addr); */
 	H713_TRACE_WRITE(h713, afbd_ctrl, H713_AFBD_CTRL_BASE, 0x78,
 			 "AFBD_FB_ADDR", (u32)geo->fb_addr);
 }
@@ -647,6 +889,9 @@ static void h713_pipe_enable(struct drm_simple_display_pipe *pipe,
 	/* Step 3: Program TVTOP bus fabric routing */
 	h713_tvtop_enable(h713);
 
+	/* Step 3b: Apply LVDS PHY corrections (override u-boot defaults) */
+	h713_lvds_apply_corrections(h713);
+
 	/* Step 4: Verify VBlender is alive */
 	ctrl = h713_read(h713->vblend, VB_CTRL);
 	hact = h713_read(h713->vblend, VB_H_ACTIVE);
@@ -665,8 +910,10 @@ static void h713_pipe_enable(struct drm_simple_display_pipe *pipe,
 	}
 
 	{
-		dma_addr_t addr = H713_UBOOT_SCANOUT_ADDR;
-		const char *scanout_src = "u-boot-fallback";
+		dma_addr_t addr = h713_mips_scanout_addr ?
+			(dma_addr_t)h713_mips_scanout_addr : H713_UBOOT_SCANOUT_ADDR;
+		const char *scanout_src = h713_mips_scanout_addr ?
+			"mips-nv12" : "u-boot-fallback";
 		bool frame_programmed = false;
 
 		/*
@@ -675,6 +922,130 @@ static void h713_pipe_enable(struct drm_simple_display_pipe *pipe,
 		 * each register group is validated against visual output.
 		 */
 		/* h713_program_stream_setup(h713); */
+
+		/* TEMP: optional plane-init test (controlled by plane_init_steps) */
+		h713_run_plane_init(h713);
+
+		/*
+		 * ch0_mode override: enable ch0 NV12-scanout (stock-conform).
+		 * Schreibe BEFORE ch1_mode-block damit ch0-write zuerst happens, dann
+		 * optional ch1-disable. See module-param doc above.
+		 */
+		if (h713_ch0_mode > 0) {
+			/* +0x00 (= afbd_ctrl base + 0x00 = 0x05600100) ch0_ctrl
+			 * 0x83001901 = stock NV12-mode + bit 31 + bit 0 (enable) */
+			h713_write(h713->afbd_ctrl, 0x00, 0x83001901);
+
+			if (h713_ch0_mode >= 2) {
+				/* +0x40 ch1_ctrl: disable ch1 (clear bit 0).
+				 * Stock value 0x83001900 — bit 0 cleared = channel-disable. */
+				h713_write(h713->afbd_ctrl, 0x40, 0x83001900);
+			}
+
+			if (h713_ch0_mode >= 3) {
+				/* +0x300 src_mux: force bit 14 (ch0-active source) +
+				 * other stock-conform bits. Stock-android trace baseline
+				 * showed value 0x00804258 / 0x0080c258 (bit 15 toggles).
+				 * BB phase 3 + heutige direct /dev/mem writes were REJECTED.
+				 * Try kernel-MMIO write from afbd_base — sometimes accepted
+				 * where userspace /dev/mem is rejected. */
+				h713_write(h713->afbd_base, 0x300, 0x00804258);
+			}
+
+			if (h713_ch0_mode >= 4) {
+				/* mode 4: full stock-conform ch0 init from
+				 * stock-0x5600000-post.txt comparison. Mainline only writes
+				 * ch1 registers (+0x140..+0x16c) at init; ch0 (+0x100..+0x12c)
+				 * stays at u-boot default (= 0x00010000 = disabled). Stock
+				 * configures BOTH channels; ch0 is the active scanout source.
+				 *
+				 * Stock register values (post-HDMI-source-switch state):
+				 *   +0x100 = 0x83001901   ch0_ctrl (NV12 + bit31 + enable)
+				 *   +0x108 = 0x008000ff   ch0_dim?
+				 *   +0x10c = 0x00ff0080   ch0_format?
+				 *   +0x124 = 0x00000808   ch0_quirk
+				 *   +0x128 = 0x00000000   ch0_quirk
+				 *   +0x12c = 0x00000021   ch0_quirk
+				 *
+				 * Plus +0x310 = 0x00a00210 has bit 21 set in stock vs
+				 * 0x00800210 in mainline — bit 21 may be ch0-active-source
+				 * indicator.
+				 *
+				 * Plus +0x10/+0x14 trigger (memory_agent_onoff equivalent):
+				 *   +0x10 |= 0x3   bits 0+1 — kick HW state machine
+				 *   +0x14 |= 0x1   bit 0    — secondary enable
+				 */
+				h713_write(h713->afbd_ctrl, 0x08, 0x008000ff);
+				h713_write(h713->afbd_ctrl, 0x0c, 0x00ff0080);
+				h713_write(h713->afbd_ctrl, 0x24, 0x00000808);
+				h713_write(h713->afbd_ctrl, 0x28, 0x00000000);
+				h713_write(h713->afbd_ctrl, 0x2c, 0x00000021);
+
+				/* PHASE-B fix: stock has 0x00800210, NOT 0x00a00210 (bit21 wrong) */
+				h713_write(h713->afbd_base, 0x310, 0x00800210);
+
+				/* PHASE-B fix B5: NRWinNode bit 4 = 0x10. Stock dump shows
+				 * +0x05600060 = 0x11 (bit 0 + bit 4), mainline u-boot leaves
+				 * bit 4 unset. Without this AFBD pool-1 reading is ungated. */
+				{
+					u32 v60 = readl(h713->afbd_base + 0x60);
+					h713_write(h713->afbd_base, 0x60, v60 | 0x10);
+				}
+
+				/* Trigger HW state machine via +0x10/+0x14. Per memory
+				 * project_panelwinnode_re_lvds_finding.md MIPS does this
+				 * via memory_agent_onoff(bit 5, on=1). On mainline MIPS
+				 * never invokes that in our flow. */
+				{
+					u32 v10 = readl(h713->afbd_base + 0x10);
+					u32 v14 = readl(h713->afbd_base + 0x14);
+					h713_write(h713->afbd_base, 0x10, v10 | 0x3);
+					h713_write(h713->afbd_base, 0x14, v14 | 0x1);
+				}
+			}
+
+			dev_info(h713->drm.dev,
+				 "ch0_mode=%u — ch0 NV12 enabled%s%s%s\n",
+				 h713_ch0_mode,
+				 h713_ch0_mode >= 2 ? " (ch1 disabled)" : "",
+				 h713_ch0_mode >= 3 ? " (src_mux=0x804258)" : "",
+				 h713_ch0_mode >= 4 ? " (full ch0 init + trigger)" : "");
+		}
+
+		/*
+		 * ch1_mode override: replaces u-boot's XRGB ch1 defaults with NV12-mode
+		 * register values so MIPS-output buffer (NV12 stride 1920) matches what
+		 * the AFBD scanout reads. See module-param doc above.
+		 */
+		if (h713_ch1_mode > 0) {
+			/* CTRL change skipped: bit 31 (0x80000000) was hypothesised as
+			 * NV12-trigger but mode=2 with 0x83001901 → black screen. Likely
+			 * bit 31 disables scanout-out or selects Y-only mode. Leave ctrl
+			 * at u-boot XRGB default 0x03001901; only adjust strides. */
+
+			/* +0x70 ch1 stride1: 0x780 = 1920 = NV12 Y-stride (1 byte/pixel) */
+			h713_write(h713->afbd_ctrl, 0x70, 0x00000780);
+
+			if (h713_ch1_mode >= 2) {
+				/* +0x74 ch1 stride2: 1080 << 16 | 1920 (instead of XRGB
+				 * 1080 << 16 | 7680). Hypothesis: stride2 controls the
+				 * line-step hardware uses for vertical advance — fixing it
+				 * to 1920 should kill the 4× horizontal repeat seen in mode 1. */
+				h713_write(h713->afbd_ctrl, 0x74, 0x04380780);
+			}
+
+			if (h713_ch1_mode >= 3) {
+				/* mode 3: extended quirks +0x48/+0x4c/+0x64/+0x68/+0x6c
+				 * werte aus stock-RE noch ausstehend — fall back to mode 2
+				 */
+				dev_warn(h713->drm.dev,
+					 "ch1_mode=3 quirks not yet implemented — using mode 2\n");
+			}
+
+			dev_info(h713->drm.dev,
+				 "ch1_mode=%u override applied (NV12 stride/format)\n",
+				 h713_ch1_mode);
+		}
 
 		if (fb) {
 			struct drm_gem_dma_object *gem = drm_fb_dma_get_gem_obj(fb, 0);
