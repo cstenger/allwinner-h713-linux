@@ -26,15 +26,13 @@ monolithic files that preceded the modular approach entirely.
 | `sunxi-mipsloader.c`     | `0010-misc-add-sunxi-mipsloader.patch`    | 2026-04-01 | MIPS coprocessor loader (monolithic) |
 | `sunxi-nsi.c`            | `0011-misc-add-sunxi-nsi.patch`           | 2026-04-01 | ARM↔MIPS NSI interface (monolithic)  |
 
-## Current drivers
+## Current modules
 
-The actively maintained versions are:
+The actively maintained out-of-tree modules are at:
 
-- [`drivers/tvtop/`](../tvtop/) — out-of-tree module
-- [`drivers/decd/`](../decd/) — out-of-tree module
-- `cpu_comm` — now **in-tree** (`patches/0024-soc-sunxi-add-cpu-comm-and-msgbox-ipc.patch`,
-  built from `drivers/soc/sunxi/cpu_comm/`, `CONFIG_HY310_CPU_COMM=m`)
+- [`drivers/display/tvtop/`](../display/tvtop/)
+- [`drivers/display/decd/`](../display/decd/)
+- [`drivers/cpu_comm/`](../cpu_comm/)
 
-See [`docs/subsystems/cpu-comm.md`](../../docs/subsystems/cpu-comm.md) and
-[`docs/subsystems/display.md`](../../docs/subsystems/display.md) for subsystem
-documentation.
+See [`docs/CPU_COMM.md`](../../docs/CPU_COMM.md) and
+[`docs/DISPLAY.md`](../../docs/DISPLAY.md) for subsystem documentation.

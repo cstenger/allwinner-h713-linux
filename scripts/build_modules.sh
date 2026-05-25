@@ -8,11 +8,11 @@
 # Build order matters — dependencies are resolved sequentially:
 #   1. TVTOP (display bus fabric — no deps)
 #   2. DECD (video decoder — no deps)
-#   3. Audio codec/cpudai/machine (flat directory)
-#   4. Audio bridge (TridentALSA)
-#   5. GE2D display (legacy, depends on TVTOP symbols)
-#   6. WiFi AIC8800 (bsp + fdrv + btlpm)
-# (CPU_COMM + msgbox are built in-tree, not here — patch 0024.)
+#   3. CPU_COMM (ARM↔MIPS IPC — no deps)
+#   4. Audio codec/cpudai/machine (flat directory)
+#   5. Audio bridge (TridentALSA)
+#   6. GE2D display (legacy, depends on TVTOP symbols)
+#   7. WiFi AIC8800 (bsp + fdrv + btlpm)
 #
 # Author: well0nez
 # SPDX-License-Identifier: GPL-2.0
@@ -36,7 +36,7 @@ echo "Kernel: $KERNEL_SRC"
 echo ""
 
 # Step 1: TVTOP (display bus fabric)
-echo "--- [1/6] TVTOP display module ---"
+echo "--- [1/7] TVTOP display module ---"
 $MAKE M="$REPO_DIR/drivers/tvtop" modules
 # Merge TVTOP symbols into kernel Module.symvers for downstream modules
 if [ -f "$REPO_DIR/drivers/tvtop/Module.symvers" ]; then
@@ -46,7 +46,7 @@ fi
 echo ""
 
 # Step 2: DECD (video decoder)
-echo "--- [2/6] DECD video decoder module ---"
+echo "--- [2/7] DECD video decoder module ---"
 $MAKE M="$REPO_DIR/drivers/decd" modules
 if [ -f "$REPO_DIR/drivers/decd/Module.symvers" ]; then
     cat "$REPO_DIR/drivers/decd/Module.symvers" >> "$KERNEL_SRC/Module.symvers"
@@ -54,11 +54,17 @@ if [ -f "$REPO_DIR/drivers/decd/Module.symvers" ]; then
 fi
 echo ""
 
-# CPU_COMM is built in-tree (CONFIG_HY310_CPU_COMM=m, patch 0024) together
-# with its msgbox transport - not an out-of-tree module. Nothing to do here.
+# Step 3: CPU_COMM (ARM↔MIPS IPC)
+echo "--- [3/7] CPU_COMM IPC module ---"
+$MAKE M="$REPO_DIR/drivers/cpu_comm" modules
+if [ -f "$REPO_DIR/drivers/cpu_comm/Module.symvers" ]; then
+    cat "$REPO_DIR/drivers/cpu_comm/Module.symvers" >> "$KERNEL_SRC/Module.symvers"
+    echo "  → CPU_COMM symbols merged into kernel Module.symvers"
+fi
+echo ""
 
 # Step 4: Audio (codec + cpudai + machine)
-echo "--- [3/6] Audio modules (codec, cpudai, machine) ---"
+echo "--- [4/7] Audio modules (codec, cpudai, machine) ---"
 $MAKE M="$REPO_DIR/drivers/audio" modules
 if [ -f "$REPO_DIR/drivers/audio/Module.symvers" ]; then
     cat "$REPO_DIR/drivers/audio/Module.symvers" >> "$KERNEL_SRC/Module.symvers"
@@ -67,12 +73,12 @@ fi
 echo ""
 
 # Step 5: Audio bridge
-echo "--- [4/6] Audio bridge module ---"
+echo "--- [5/7] Audio bridge module ---"
 $MAKE M="$REPO_DIR/drivers/audio/bridge" modules
 echo ""
 
 # Step 6: GE2D display (depends on TVTOP symbols)
-echo "--- [5/6] GE2D display module ---"
+echo "--- [6/7] GE2D display module ---"
 EXTRA_SYMBOLS="$REPO_DIR/drivers/tvtop/Module.symvers"
 if [ -f "$EXTRA_SYMBOLS" ]; then
     KBUILD_EXTRA_SYMBOLS="$EXTRA_SYMBOLS" $MAKE M="$REPO_DIR/drivers/display/ge2d" modules
@@ -83,7 +89,7 @@ fi
 echo ""
 
 # Step 7: WiFi AIC8800
-echo "--- [6/6] WiFi AIC8800 modules (bsp + fdrv + btlpm) ---"
+echo "--- [7/7] WiFi AIC8800 modules (bsp + fdrv + btlpm) ---"
 $MAKE M="$REPO_DIR/drivers/wifi" modules
 echo ""
 

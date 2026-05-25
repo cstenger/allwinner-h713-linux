@@ -104,8 +104,8 @@ driver.
 
 ### hy310-hdmird daemon
 
-Sessions V-W. C++ ARM32 cross-compiled daemon, source in the repo at
-`userspace/hy310-hdmird/`. Replicates the stock tvserver init + source-switch:
+Sessions V-W. C++ ARM32 cross-compiled daemon at `/opt/hy310/hy310-hdmird/`.
+Replicates the stock tvserver init + source-switch:
 
 1. Open `/dev/cpu_comm`, mmap 5 MB shmem at phys `0x4E300000`.
 2. Load `hdcp_v22.bin` (960 B from stock `vendor/etc/firmware/`) into shmem at
