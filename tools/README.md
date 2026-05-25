@@ -7,8 +7,17 @@ Many can be run on the HY310 directly.
 
 ### `uboot_interrupt.py`
 
-Connects to HY310 UART (via OrangePi TCP bridge at `192.168.8.179:9999`)
-and sends rapid keypresses to interrupt U-Boot's `bootdelay=5` window.
+Spams keypresses through the HY310 UART to interrupt U-Boot's
+`bootdelay=5` window. The default config in the script connects to a
+**TCP-to-serial bridge at `192.168.8.179:9999`** — that's our specific
+bench setup (an Orange Pi PC running `ser2net`).
+
+If you use a **direct USB-UART cable** instead (the simpler path), edit
+the script's connection setup to read/write `/dev/ttyUSB0` (or your
+adapter's device path) at 115200 8N1 instead of opening a TCP socket.
+
+See [docs/subsystems/uart.md](../docs/subsystems/uart.md) for both
+approaches.
 
 ```sh
 python3 tools/uboot_interrupt.py                # drop to U-Boot prompt

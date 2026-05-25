@@ -226,6 +226,19 @@ These are scars from 50+ sessions:
   recover MIPS from a stuck WAIT-ACK state. If `cat /sys/class/hy300/mips/state_machine`
   returns nothing after a software reboot, that's the indicator.
 
+## Reference: pre-refactor archived source
+
+`drivers/Archived/` holds **read-only reference copies** of `cpu_comm`,
+`tvtop`, `decd`, plus older monolithic `sunxi-mipsloader.c` /
+`sunxi-nsi.c` from before the 2026-04-10 refactor. They're not compiled,
+not linked into any Makefile — they're there for "what did the old
+implementation do at this exact register?" lookups. See
+`drivers/Archived/README.md` for the mapping to which old patches they
+came from.
+
+If you're tracing back an implementation decision in the RE notes, the
+archived versions are usually what the older session was working with.
+
 ## Setting up the build environment
 
 If you're new, this is the minimum to get a build:

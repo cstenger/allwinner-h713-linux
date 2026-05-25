@@ -42,7 +42,9 @@
 | **DLP projector output (LVDS)** | ⚠️ broken picture | `h713_drm` ch1 XRGB hack | The only output the device has. Currently shows the broken HDMI-RX content. |
 | GPU | ⚠️ disabled | `panfrost` (built but not loaded) | Worked previously; off while debugging display pipeline |
 | Wayland desktop | ⚠️ off | Labwc + Panfrost | Output is currently routed to the HDMI-RX scanout path, not a compositor |
-| Video decode (Cedrus) | ⚠️ disabled | `sunxi-cedrus` (built but not loaded) | Same as GPU |
+| Video decode (Cedrus) | ⚠️ disabled | `sunxi-cedrus` (built but not loaded) | Same as GPU. H.264/H.265/MPEG-2/VP8 |
+| Video decode (AV1) | ⚠️ untested | `sun50i-h713-av1` (in `drivers/media/av1/`, not in defconfig) | Standalone H713 AV1 hw decoder, V4L2 stateless. Source present, never enabled or tested |
+| `sunxi_tvtop` (display bus fabric + clocks) | ✅ works | OOT module | Required for any display sub-block to respond. Used as client by `h713_drm`, `sunxi_ge2d`, `sunxi_decd` |
 | IOMMU | ⚠️ provider only | `sun50i-iommu` (built-in) | Runs; no consumer attached |
 | GPADC | ✅ works | `sun20i-gpadc` IIO | 2 channels |
 | LRADC | ✅ works | `sun50i-h713-lradc` IIO | NTC temp sensing |

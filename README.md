@@ -114,9 +114,11 @@ drivers/              Out-of-tree kernel modules
   decd/                 Mainline port of stock decd.ko (currently inactive)
   display/drm/          h713_drm DRM/KMS shim (active for limited scanout)
   display/ge2d/         Mainline port of stock ge2d_dev.ko (blacklisted — will become primary)
+  media/av1/            H713 AV1 hw decoder (V4L2 stateless, source present, NOT in defconfig — untested)
   misc/                 Board manager (fan, NTC, GPIO)
-  tvtop/                sunxi_tvtop clock manager
+  tvtop/                sunxi_tvtop display bus fabric + clock manager (required by display drivers)
   wifi/                 AIC8800D80 SDIO + BT
+  Archived/             Read-only reference copies of pre-refactor cpu_comm/tvtop/decd. NOT compiled.
 scripts/              Build, flash, module install
 tools/                MIPS elog reader, env analyzer, regression tests
 docs/                 Documentation (subsystems/ + re/)

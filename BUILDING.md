@@ -41,18 +41,36 @@ for p in $(cat /path/to/hy310-linux/patches/series); do
 done
 ```
 
-The patch set is 8 patches:
+The patch set (19 patches, listed in `patches/series`):
 
-```
-0001-clk-sunxi-ng-add-h713-ccu-driver.patch
-0002-pinctrl-sunxi-add-h713-pio-driver.patch
-0003-pinctrl-sunxi-add-h713-r-pio-driver.patch
-0004-pinctrl-sunxi-fix-irq-mux-and-graceful-resource.patch
-0005-phy-sun4i-usb-add-h713-pmu-bit0-quirk.patch
-0006-mmc-sunxi-add-h713-v5p3x-support.patch
-0007-pwm-add-sun8i-8channel-driver.patch
-0008-misc-add-hy310-board-mgr.patch
-```
+| Patch | Type | What it adds / changes |
+|---|---|---|
+| `0001-clk-sunxi-ng-add-h713-ccu-driver.patch` | new | H713 CCU driver (1149 LOC) |
+| `0002-pinctrl-sunxi-add-h713-pio-driver.patch` | new | H713 main pinctrl (749 LOC) |
+| `0003-pinctrl-sunxi-add-h713-r-pio-driver.patch` | new | H713 R-pinctrl (203 LOC) with NEW_REG_LAYOUT |
+| `0004-pinctrl-sunxi-fix-irq-mux-and-graceful-resource.patch` | edit | sunxi pinctrl: IRQ mux + graceful resource |
+| `0005-phy-sun4i-usb-add-h713-pmu-bit0-quirk.patch` | edit | USB PHY: PMU bit-0 quirk |
+| `0006-mmc-sunxi-add-h713-v5p3x-support.patch` | edit | sunxi-mmc: v5p3x DMA reset + clock doubling |
+| `0007-pwm-add-sun8i-8channel-driver.patch` | new | sun8i PWM 8-channel driver (468 LOC) |
+| `0008-misc-add-hy310-board-mgr.patch` | new | hy310-board-mgr (fan, NTC, GPIO, 1288 LOC) |
+| `0009-misc-add-hy310-keystone-motor.patch` | new | hy310-keystone-motor (925 LOC) |
+| `0010-misc-add-sunxi-mipsloader.patch` | new | sunxi-mipsloader (906 LOC) |
+| `0011-misc-add-sunxi-nsi.patch` | new | sunxi-nsi NSI-MBUS driver (441 LOC) |
+| `0015-misc-add-h713-driver-kconfig.patch` | edit | drivers/misc/Kconfig entries for above |
+| `0016-dt-bindings-add-h713-clock-reset-ids.patch` | new | dt-bindings clock+reset IDs (155 LOC) |
+| `0017-iommu-sun50i-decouple-arm-dma-use-iommu.patch` | edit | iommu Kconfig: decouple ARM_DMA_USE_IOMMU |
+| `0018-pinctrl-sunxi-add-h713-pb-bank-to-h616.patch` | edit | pinctrl-h616: add PB bank for H713 |
+| `0019-iio-adc-add-h713-lradc-driver.patch` | new | H713 LRADC IIO driver (192 LOC) |
+| `0020-pmdomain-add-h713-ppu-driver.patch` | new | H713 PPU power domain (287 LOC) |
+| `0021-media-sunxi-cir-add-h713-vendor-init.patch` | edit | IR receiver: H713 vendor init |
+| `0022-staging-cedrus-add-h713-ve3-clock-reset.patch` | edit | Cedrus: VE3 clock+reset support |
+
+Numbering gaps (0012-0014) are intentional — those patches were abandoned
+during development.
+
+The patches add ~7000 lines of new H713-specific code and edit ~10 upstream
+kernel files. After applying, the kernel tree builds with the
+`hy310_defconfig` we ship.
 
 ## Quick build (end-to-end)
 
