@@ -22,3 +22,7 @@ staging/
 # Session backup files (do not commit)
 *.bak
 *.bak.*
+
+# Userspace app build output
+userspace/*/build/
+userspace/*/build-native/
