@@ -66,28 +66,144 @@ static void __iomem *msgbox_ctrl_base;	/* ioremap of 0x03003000 */
  *   TX: sx_base(mdev, MIPS=1) + port*4 + offset
  * With port=0, ARM_base=0x03003000, MIPS_base=0x03003400:
  */
-#define H713_MSGBOX_RX_FIFO	0x60	/* ARM base+0x60: RX FIFO count */
-#define H713_MSGBOX_RX_DATA	0x70	/* ARM base+0x70: RX auto-pop read */
-#define H713_MSGBOX_RX_IRQ_EN	0x20	/* ARM base+0x20: RX IRQ enable */
-#define H713_MSGBOX_RX_IRQ_CLR	0x24	/* ARM base+0x24: RX IRQ clear (W1C) */
-#define H713_MSGBOX_TX_DATA	0x474	/* MIPS User1 Port1 FIFO write */
-#define H713_MSGBOX_TX_FIFO	0x464	/* MIPS User1 Port1 FIFO status */
+/*
+ * H713 msgbox layout (Stock-RE from sunxi_msgbox_amp.c):
+ *
+ *   sx_base(mdev, i)  = user bank i  (User0=0x3003000, User1/MIPS=0x3003400,
+ *                                     User2=0x3003800)
+ *   adj(l, r)         = (l < r) ? r-1 : r   // peer-block idx within bank
+ *   USER_STRIDE       = 256
+ *
+ *   TX (ARM writes to MIPS bank):
+ *     reg = sx_base(R=MIPS) + USER_STRIDE * adj(L=ARM, R=MIPS) + offset
+ *         = 0x3003400 + 256*0 + offset
+ *     port 1 MSG_DATA = 0x3003400 + 0 + 0x70 + 4 = 0x3003474
+ *
+ *   RX (ARM reads from MIPS bank):
+ *     ra  = (R >= L) ? L : L - 1            = 0
+ *     reg = sx_base(R=MIPS) + USER_STRIDE * ra + offset
+ *         = 0x3003400 + 0 + offset
+ *     port 1 FIFO_count = 0x3003400 + 0 + 0x60 + 4 = 0x3003464
+ *     port 1 MSG_DATA   = 0x3003400 + 0 + 0x70 + 4 = 0x3003474
+ *     IRQ_EN            = 0x3003400 + 0 + 0x20     = 0x3003420
+ *     IRQ_STAT/CLR      = 0x3003400 + 0 + 0x24     = 0x3003424
+ *
+ * Both TX and RX use the same port-1 register address (0x3003474) — the
+ * H713 msgbox's per-port FIFO is a single push/pop register in the
+ * remote's bank; write = enqueue-to-remote, read = pop-from-remote.
+ *
+ * Historical bug: we used base[L=ARM]+0x100+offset = 0x3003120/0x3003164
+ * — that is either an unused mirror or a different peer-block. The IRQ
+ * never asserted because the HW enable bit lives in the MIPS bank.
+ *
+ * All offsets below are relative to msgbox_ctrl_base (ioremap of 0x3003000,
+ * size 0x1000 → covers User0..User2 + headroom).
+ */
+#define H713_MSGBOX_RX_FIFO	0x464	/* MIPS bank + port 1 FIFO count */
+#define H713_MSGBOX_RX_DATA	0x474	/* MIPS bank + port 1 FIFO data  */
+#define H713_MSGBOX_RX_IRQ_EN	0x420	/* MIPS bank + RX IRQ enable    */
+#define H713_MSGBOX_RX_IRQ_CLR	0x424	/* MIPS bank + RX IRQ status/W1C */
+#define H713_MSGBOX_TX_DATA	0x474	/* MIPS bank + port 1 FIFO data */
+#define H713_MSGBOX_TX_FIFO	0x464	/* MIPS bank + port 1 FIFO count */
 
-#define H713_MSGBOX_RX_IRQ_BIT	BIT(0)	/* RX IRQ bit for port 0 */
+/*
+ * Stock-RE addition (2026-04-19): TX trigger register.
+ *
+ * Writing to FIFO data alone does NOT cause the msgbox HW to route an
+ * IRQ to MIPS-INTC. Stock sunxi_rpmsg_edp_send() sets a bit in the
+ * TX-IRQ-Enable register at offset 48 (0x30) of the destination's bank
+ * — that OR-write is what triggers the actual IRQ line.
+ *
+ * Layout (from vmlinux sunxi_rpmsg_edp_send IDA RE):
+ *   addr = sx_base(mdev, REMOTE=MIPS=1) + 256*local_adj + 48
+ *        = 0x3003400 + 256*0 + 48        (local_adj=0 because ARM=0 < MIPS=1)
+ *        = 0x3003430
+ *   bit  = 1 << (2*chan + 1)             (chan=1, matching H713_MSGBOX_RX_IRQ_BIT=BIT(2))
+ *        = 1 << 3 = BIT(3)
+ */
+#define H713_MSGBOX_TX_IRQ_EN	0x430	/* MIPS bank + TX IRQ enable (port 1) */
+#define H713_MSGBOX_TX_IRQ_BIT	BIT(3)	/* 1 << (2*chan + 1) with chan=1 */
+
+/*
+ * Port 1 RX IRQ bit. Stock-RE formula: RX_IRQ_BIT(port) = BIT(2*port).
+ * We listen on Port 1 (MIPS writes ACKs to User0 Port1 @ +0x174), so
+ * the matching IRQ-enable/status bit is BIT(2), not BIT(0).
+ * Historical bug: was BIT(0) → IRQ was enabled for Port 0 which MIPS
+ * never writes to → the GIC line never asserted → we thought IRQ didn't
+ * work and switched to polling in 2026-04-16.
+ */
+#define H713_MSGBOX_RX_IRQ_BIT	BIT(2)	/* RX IRQ bit for Port 1 */
 
 static int msgbox_irq_num = -1;
+static bool msgbox_irq_registered;
 static void (*msgbox_rx_callback)(int type, int direction);
+
+/* Fallback polling (kept for emergency use; disabled by default). */
 static struct delayed_work msgbox_poll_work;
 static bool msgbox_poll_active;
 
+/* IRQ statistics (readable via printk for verification). */
+static atomic_t msgbox_irq_count;
+static atomic_t msgbox_irq_msgs_drained;
+
 /*
- * Polling work function — processes msgbox FIFO messages.
+ * Hard IRQ handler.
  *
- * The H713 msgbox IRQ is level-triggered and stays asserted as long
- * as the FIFO contains data. Since the MIPS sends messages faster
- * than we can process+reply, a pure IRQ handler triggers the kernel's
- * IRQ storm detector (100k limit). Instead we use a polling approach:
- * drain the FIFO periodically, dispatch messages, reschedule.
+ * H713 msgbox is level-triggered and stays asserted as long as the
+ * Port 1 FIFO has data. To avoid the 100k IRQ-storm kill:
+ *   1. Mask the RX IRQ at the source (clear RX_IRQ_EN BIT(2)) first,
+ *      so re-arming only happens after we fully drain.
+ *   2. Drain every pending message from the FIFO.
+ *   3. Write-1-clear the IRQ status bit.
+ *   4. Re-enable the IRQ bit for future messages.
+ *
+ * Step 1+4 ensure the GIC sees at most one IRQ per drain-cycle, not
+ * one per message. The callback is called in IRQ context — cpu_comm's
+ * msg_cb is atomic-safe (bitop on a u32 pending mask + schedule_work).
+ */
+static irqreturn_t cpu_comm_msgbox_irq_handler(int irq, void *dev_id)
+{
+	u32 en, raw;
+	int drained = 0;
+	int type, direction;
+
+	atomic_inc(&msgbox_irq_count);
+
+	if (!msgbox_ctrl_base)
+		return IRQ_NONE;
+
+	/* 1) Mask RX IRQ bit so we don't re-fire while draining. */
+	en = readl(msgbox_ctrl_base + H713_MSGBOX_RX_IRQ_EN);
+	writel(en & ~H713_MSGBOX_RX_IRQ_BIT,
+	       msgbox_ctrl_base + H713_MSGBOX_RX_IRQ_EN);
+
+	/* 2) Drain FIFO. */
+	while (readl(msgbox_ctrl_base + H713_MSGBOX_RX_FIFO) & 0xF) {
+		raw = readl(msgbox_ctrl_base + H713_MSGBOX_RX_DATA);
+		type = (raw >> 16) & 0xFFFF;
+		direction = raw & 0xFFFF;
+		if (msgbox_rx_callback)
+			msgbox_rx_callback(type, direction);
+		if (++drained > 64)
+			break;   /* safety cap */
+	}
+	atomic_add(drained, &msgbox_irq_msgs_drained);
+
+	/* 3) W1C the RX IRQ status bit. */
+	writel(H713_MSGBOX_RX_IRQ_BIT,
+	       msgbox_ctrl_base + H713_MSGBOX_RX_IRQ_CLR);
+
+	/* 4) Re-arm the IRQ. */
+	writel(en | H713_MSGBOX_RX_IRQ_BIT,
+	       msgbox_ctrl_base + H713_MSGBOX_RX_IRQ_EN);
+
+	return drained ? IRQ_HANDLED : IRQ_NONE;
+}
+
+/*
+ * Legacy polling fallback. Only activated if CPU_COMM_FORCE_POLL is
+ * set at module-init time (compile-time symbol) or if request_irq
+ * ultimately fails.
  */
 static void cpu_comm_msgbox_poll_fn(struct work_struct *work)
 {
@@ -102,13 +218,8 @@ static void cpu_comm_msgbox_poll_fn(struct work_struct *work)
 		raw = readl(msgbox_ctrl_base + H713_MSGBOX_RX_DATA);
 		type = (raw >> 16) & 0xFFFF;
 		direction = raw & 0xFFFF;
-
-		pr_info_ratelimited("cpu_comm: msgbox rx raw=0x%08x type=%d dir=%d\n",
-				    raw, type, direction);
-
 		if (msgbox_rx_callback)
 			msgbox_rx_callback(type, direction);
-
 		if (++count > 32)
 			break;
 	}
@@ -119,38 +230,68 @@ static void cpu_comm_msgbox_poll_fn(struct work_struct *work)
 
 int cpu_comm_msgbox_request_irq(int irq, void *callback)
 {
-	u32 raw;
+	u32 raw, en;
+	int ret;
 
 	msgbox_rx_callback = callback;
+	atomic_set(&msgbox_irq_count, 0);
+	atomic_set(&msgbox_irq_msgs_drained, 0);
 
-	/* Drain stale messages before starting the poll */
+	/* Drain any stale messages before enabling IRQ. */
 	while (readl(msgbox_ctrl_base + H713_MSGBOX_RX_FIFO) & 0xF) {
 		raw = readl(msgbox_ctrl_base + H713_MSGBOX_RX_DATA);
 		pr_info("cpu_comm: drained stale msgbox message: 0x%08x\n", raw);
 	}
 
-	INIT_DELAYED_WORK(&msgbox_poll_work, cpu_comm_msgbox_poll_fn);
-	msgbox_poll_active = true;
-	schedule_delayed_work(&msgbox_poll_work, msecs_to_jiffies(10));
+	/* Clear any stale RX IRQ status. */
+	writel(H713_MSGBOX_RX_IRQ_BIT,
+	       msgbox_ctrl_base + H713_MSGBOX_RX_IRQ_CLR);
 
-	pr_info("cpu_comm: msgbox RX poll started (1ms interval, IRQ %d reserved)\n", irq);
+	ret = request_irq(irq, cpu_comm_msgbox_irq_handler,
+			  IRQF_TRIGGER_HIGH, "hy310-cpu-comm",
+			  &msgbox_irq_num);
+	if (ret) {
+		pr_err("cpu_comm: request_irq(%d) failed: %d — "
+		       "falling back to 1ms polling\n", irq, ret);
+		INIT_DELAYED_WORK(&msgbox_poll_work, cpu_comm_msgbox_poll_fn);
+		msgbox_poll_active = true;
+		schedule_delayed_work(&msgbox_poll_work,
+				      msecs_to_jiffies(10));
+		return 0; /* fallback path, not fatal */
+	}
+
+	msgbox_irq_num = irq;
+	msgbox_irq_registered = true;
+
+	/* Enable RX IRQ for Port 1 (BIT(2)). */
+	en = readl(msgbox_ctrl_base + H713_MSGBOX_RX_IRQ_EN);
+	writel(en | H713_MSGBOX_RX_IRQ_BIT,
+	       msgbox_ctrl_base + H713_MSGBOX_RX_IRQ_EN);
+
+	pr_info("cpu_comm: msgbox RX IRQ %d registered (Port 1, BIT(2)); "
+		"enable-reg: 0x%08x\n",
+		irq, readl(msgbox_ctrl_base + H713_MSGBOX_RX_IRQ_EN));
 	return 0;
 }
 
 void cpu_comm_msgbox_free_irq(void)
 {
+	if (msgbox_irq_registered && msgbox_ctrl_base) {
+		u32 en = readl(msgbox_ctrl_base + H713_MSGBOX_RX_IRQ_EN);
+		writel(en & ~H713_MSGBOX_RX_IRQ_BIT,
+		       msgbox_ctrl_base + H713_MSGBOX_RX_IRQ_EN);
+		free_irq(msgbox_irq_num, &msgbox_irq_num);
+		msgbox_irq_registered = false;
+		pr_info("cpu_comm: msgbox RX IRQ freed (count=%d, drained=%d msgs)\n",
+			atomic_read(&msgbox_irq_count),
+			atomic_read(&msgbox_irq_msgs_drained));
+	}
 	if (msgbox_poll_active) {
 		msgbox_poll_active = false;
-		/*
-		 * Use cancel_delayed_work (non-sync) to avoid blocking
-		 * during shutdown. The poll_fn checks msgbox_poll_active
-		 * at entry and returns immediately when false.
-		 * _sync variant hangs if MMIO is already dead during reboot.
-		 */
 		cancel_delayed_work(&msgbox_poll_work);
-		msgbox_rx_callback = NULL;
-		pr_info("cpu_comm: msgbox RX poll stopped\n");
+		pr_info("cpu_comm: msgbox RX poll stopped (fallback)\n");
 	}
+	msgbox_rx_callback = NULL;
 }
 
 /* Legacy stubs — no longer needed but keep exports for now */
@@ -516,6 +657,8 @@ static int spinLock(int lock_id, int mode)
 	u8 *base = getSpinLockMemArea();
 	u8 *entry = base + SPINLOCK_ENTRY_SIZE * lock_id;
 	u8 cur_cpu;
+	unsigned int retries = 0;
+	const unsigned int max_retries = 10000; /* ~10s worst case with schedule() */
 
 	if (lock_id > SPINLOCK_MAX_ID) {
 		pr_err("cpu_comm: spinLock: invalid lock_id %d\n", lock_id);
@@ -527,6 +670,15 @@ static int spinLock(int lock_id, int mode)
 	}
 
 	while (1) {
+		if (++retries > max_retries) {
+			pr_err("cpu_comm: spinLock(%d, mode=%d): TIMEOUT after %u retries "
+			       "(owner=%u thread_id=0x%x refcnt=%d) — returning -EBUSY\n",
+			       lock_id, mode, retries,
+			       entry[SPINLOCK_OFF_OWNER],
+			       *(u32 *)(entry + 8),
+			       *(int *)(entry + 4));
+			return -EBUSY;
+		}
 		enterCritical(lock_id);
 		cur_cpu = (u8)getCurCPUID(0);
 
@@ -816,7 +968,7 @@ void comm_SpinLockCleanUpInCPUReset(u32 cpu_id)
  */
 void sunxi_cpu_comm_send_intr_to_mips(u32 cpu, u32 type, u32 value)
 {
-	u32 raw;
+	u32 raw, tx_en;
 
 	if (!msgbox_ctrl_base) {
 		pr_err("cpu_comm: msgbox not mapped, can't send intr!\n");
@@ -829,12 +981,33 @@ void sunxi_cpu_comm_send_intr_to_mips(u32 cpu, u32 type, u32 value)
 	 * Message format:
 	 *   raw[31:16] = msg_type (0..3)
 	 *   raw[15:0]  = direction/intr_type (stock: 2)
+	 *
+	 * HY310-fix 2026-04-18: previous code did `raw = cpu & 0x3` which
+	 * dropped intr_type — for dir=0 that wrote plain 0x00000000 to the
+	 * FIFO and MIPS's IRQ handler saw (type=0, direction=0) which it
+	 * treats as no-op. Must encode both halves as stock does.
 	 */
-	raw = cpu & 0x3;	/* MIPS expects plain 0-3 comm_type */
+	raw = ((cpu & 0x3) << 16) | (type & 0xFFFF);
 
-	/* TX goes to MIPS base (0x400 offset) + 0x70 */
+	/* 1) Write payload into MIPS bank + port 1 FIFO data (0x3003474). */
 	writel(raw, msgbox_ctrl_base + H713_MSGBOX_TX_DATA);
-	pr_info_ratelimited("cpu_comm: msgbox tx raw=0x%08x\n", raw);
+
+	/*
+	 * 2) HY310-fix 2026-04-19 (Option A / hybrid): set TX-IRQ-Enable bit
+	 *    in MIPS bank @ +0x30. Without this bit, the msgbox HW accepts
+	 *    our FIFO-write (FIFO count increments) but never routes an IRQ
+	 *    to the MIPS-INTC — so MIPS stays in WFI and never drains the
+	 *    FIFO. Mari measured MIPS-INTC Pending1 = 0 after TX, confirming
+	 *    the missing IRQ. See stock `sunxi_rpmsg_edp_send` (vmlinux IDA):
+	 *        *(base[dst]+256*local_adj+48) |= (1 << (2*chan+1))
+	 *    Use RMW so we don't clobber other channels' enables.
+	 */
+	tx_en = readl(msgbox_ctrl_base + H713_MSGBOX_TX_IRQ_EN);
+	writel(tx_en | H713_MSGBOX_TX_IRQ_BIT,
+	       msgbox_ctrl_base + H713_MSGBOX_TX_IRQ_EN);
+
+	pr_info_ratelimited("cpu_comm: msgbox tx raw=0x%08x tx_en=0x%08x→0x%08x\n",
+			    raw, tx_en, tx_en | H713_MSGBOX_TX_IRQ_BIT);
 }
 
 /* ── Register mapping init/cleanup ─────────────────────────── */

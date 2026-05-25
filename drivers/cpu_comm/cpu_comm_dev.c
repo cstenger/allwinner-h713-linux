@@ -54,6 +54,7 @@
 #include <linux/io.h>
 #include <linux/delay.h>
 #include <linux/of_irq.h>
+#include <linux/cacheflush.h>
 #include "cpu_comm.h"
 
 #define DEVICE_NAME	"cpu_comm"
@@ -1116,27 +1117,22 @@ int cpu_comm_init(int mode)
 		return -EINVAL;
 	}
 
-	/* Map shared memory into kernel VA (uncacheable) */
-	page_count = (ShMemSize + PAGE_SIZE - 1) >> PAGE_SHIFT;
-	pages = vmalloc(page_count * sizeof(struct page *));
-	if (!pages)
-		return -ENOMEM;
-
-	for (i = 0; i < page_count; i++)
-		pages[i] = pfn_to_page((ShMemAddr >> PAGE_SHIFT) + i);
-
 	/*
-	 * SharedMem MUST be uncached — both ARM and MIPS access it.
-	 * pgprot_writecombine buffers reads → ARM never sees MIPS writes.
-	 * Stock uses pgprot_kernel & 0xFFFFFDC3 | 0x204 (strongly ordered).
-	 * pgprot_noncached is the mainline equivalent.
+	 * Map shared memory via ioremap (Device/uncached).
+	 *
+	 * The region is "no-map" reserved in DT, so it is NOT in the kernel
+	 * linear map — there is no struct page for these pfns, which made
+	 * the previous vmap(pfn_to_page(), pgprot_noncached) approach return
+	 * garbage 0xffffffff on reads.
+	 *
+	 * ioremap on a no-map reserved region creates a clean Device mapping
+	 * straight from the physical address, with no struct page dependency
+	 * and no aliasing. Reads go directly to DRAM, matching what MIPS
+	 * (via its uncached/coherent mapping) wrote.
 	 */
-	vaddr = vmap(pages, page_count, VM_MAP,
-		     pgprot_noncached(PAGE_KERNEL));
-	vfree(pages);
-
+	vaddr = ioremap(ShMemAddr, ShMemSize);
 	if (!vaddr) {
-		pr_err("cpu_comm: failed to vmap shared memory\n");
+		pr_err("cpu_comm: ioremap of SharedMem failed\n");
 		return -ENOMEM;
 	}
 
@@ -1146,31 +1142,50 @@ int cpu_comm_init(int mode)
 	pr_info("cpu_comm: shared memory mapped: phys=0x%x virt=0x%x size=0x%x\n",
 		ShMemAddr, ShMemAddrBase, ShMemSize);
 
+	/* Drop any stale cache lines for the SharedMem range so the next
+	 * read sees what MIPS actually wrote to DRAM, not whatever ARM
+	 * speculatively prefetched before MIPS got there. */
+	invalidate_kernel_vmap_range(vaddr, ShMemSize);
+
 	pr_info("cpu_comm: PRE-WIPE: ARM=0x%x MIPS=0x%x magic1=0x%x magic2=0x%x\n",
 		readl(vaddr + 0x4CDC), readl(vaddr + 0x4CE0),
 		readl(vaddr + 0x90), readl(vaddr + 0x75B8));
 
 	/*
-	 * NO WIPE. U-Boot + MIPS firmware have already initialized SharedMem
-	 * before Linux boots. Any memset_io here destroys:
-	 *   - MIPS SMM heap pointers (trid_smm ShStartAddr → 0x0)
-	 *   - MIPS CPU flags (READY, APP_READY)
-	 *   - FusionDale state registrations
-	 *   - TSE data lookup tables
+	 * SELECTIVE WIPE.
 	 *
-	 * MIPS elog showed: "ShStartAddr=0x0, size=0x0" after wipe.
-	 * Stock ARM driver (cpu_comm_dev.ko) does NOT wipe SharedMem
-	 * when magics are already set (DEADBEEF check in InitCommMem).
+	 * Zero out SharedMem EXCEPT the 4 critical 4-byte words:
+	 *   magic1 @ 0x0090
+	 *   ARM_flag @ 0x4CDC
+	 *   MIPS_flag @ 0x4CE0
+	 *   magic2 @ 0x75B8
 	 *
-	 * We preserve the entire SharedMem content and only re-init
-	 * our ARM-side structures (spinlocks, routing table, etc.)
-	 * in the code below.
+	 * Wiping garbage 0xffffffff from routing table, message pool, SMM
+	 * metadata etc. prevents MIPS-FW from reading poisoned state and
+	 * looping in "Wait CPUNoticeReqed". Preserving magics + flags keeps
+	 * the U-Boot/MIPS handshake intact.
+	 *
+	 * Range 1: [0x0000, 0x008F]                       before magic1
+	 * Range 2: [0x0094, 0x4CDB]                       between magic1 and ARM_flag
+	 * Range 3: [0x4CE4, 0x75B7]                       between MIPS_flag and magic2
+	 * Range 4: [0x75BC, SHMEM_OFF_SMM_HEAP - 1]       after magic2, before SMM heap
 	 */
 	{
 		u32 magic1 = readl(vaddr + SHMEM_OFF_MAGIC1);
 		u32 magic2 = readl(vaddr + SHMEM_OFF_MAGIC2);
 
-		pr_info("cpu_comm: SHMEM preserved (magic1=0x%x magic2=0x%x) — NO wipe\n",
+		/* Range 1: 0x00 .. 0x8F (before magic1) */
+		memset_io(vaddr, 0, SHMEM_OFF_MAGIC1);
+		/* Range 2: 0x94 .. 0x4CDB (between magic1 and ARM_flag) */
+		memset_io(vaddr + SHMEM_OFF_MAGIC1 + 4, 0,
+			  0x4CDC - (SHMEM_OFF_MAGIC1 + 4));
+		/* Range 3: 0x4CE4 .. 0x75B7 (between MIPS_flag and magic2) */
+		memset_io(vaddr + 0x4CE4, 0, SHMEM_OFF_MAGIC2 - 0x4CE4);
+		/* Range 4: 0x75BC .. (SHMEM_OFF_SMM_HEAP - 1) */
+		memset_io(vaddr + SHMEM_OFF_MAGIC2 + 4, 0,
+			  SHMEM_OFF_SMM_HEAP - (SHMEM_OFF_MAGIC2 + 4));
+
+		pr_info("cpu_comm: SELECTIVE WIPE done — magics preserved: magic1=0x%x magic2=0x%x\n",
 			magic1, magic2);
 	}
 
@@ -1357,17 +1372,37 @@ int cpu_comm_init(int mode)
 	}
 	pr_debug("cpu_comm: InitCommMem done\n");
 
-	/* NOW start message reception — SharedMem is ready */
+	/* NOW start message reception — SharedMem is ready.
+	 *
+	 * HY310-fix 2026-04-18: DTS declares 3 msgbox IRQs (SPI 46, 108, 109).
+	 * MIPS can fire on ANY of them depending on User-bank direction; we
+	 * previously only requested index 0 (SPI 46) and missed MIPS ACKs on
+	 * the other two banks. Request all three; they all share one handler.
+	 */
 	{
-		int irq = platform_get_irq(to_platform_device(cpu_comm_mbox_dev), 0);
+		struct platform_device *pdev =
+			to_platform_device(cpu_comm_mbox_dev);
+		int i, irq, total = 0;
 
-		if (irq > 0) {
-			ret = cpu_comm_msgbox_request_irq(irq, (void *)cpu_comm_msg_cb);
-			if (ret)
-				pr_err("cpu_comm: msgbox IRQ registration failed: %d\n", ret);
-		} else {
-			pr_warn("cpu_comm: no msgbox IRQ in DTS (err=%d)\n", irq);
+		for (i = 0; i < 3; i++) {
+			irq = platform_get_irq(pdev, i);
+			if (irq <= 0) {
+				pr_info("cpu_comm: no msgbox IRQ[%d] in DTS (err=%d)\n",
+					i, irq);
+				continue;
+			}
+			ret = cpu_comm_msgbox_request_irq(irq,
+					(void *)cpu_comm_msg_cb);
+			if (ret) {
+				pr_err("cpu_comm: msgbox IRQ[%d]=%d registration failed: %d\n",
+					i, irq, ret);
+			} else {
+				pr_info("cpu_comm: msgbox IRQ[%d]=%d registered\n",
+					i, irq);
+				total++;
+			}
 		}
+		pr_info("cpu_comm: %d/3 msgbox IRQs registered\n", total);
 	}
 
 	/*
@@ -1392,15 +1427,13 @@ int cpu_comm_init(int mode)
 		 * Flag bits: BIT(0)=READY, BIT(1)=NOT_READY, BIT(2)=APP_READY, BIT(3)=RESET/NOTICE_REQ
 		 */
 		{
-			u32 tmp;
 			comm_SpinLock(3);
-			tmp = *arm_flag;
-			tmp |= BIT(0);   /* READY */
-			tmp &= ~BIT(1);  /* clear NOT_READY */
-			tmp &= ~BIT(3);  /* clear RESET/NOTICE_REQ */
-			*arm_flag = tmp;
+			/* ARM writes its OWN flag: READY + APP_READY set.
+			 * This is the legitimate handshake — MIPS polls arm_flag
+			 * to see when the ARM side of shared memory is ready. */
+			*arm_flag = BIT(0) | BIT(2);  /* READY + APP_READY = 0x5 */
 			comm_SpinUnLock(3, 0);
-			pr_info("cpu_comm: ARM READY set (no APP_READY — MIPS sets its own)\n");
+			pr_info("cpu_comm: ARM READY+APP_READY set to 0x%x\n", *arm_flag);
 		}
 
 		pr_info("cpu_comm: POST-INIT: magic1=0x%x magic2=0x%x ARM=0x%x MIPS=0x%x\n",
@@ -1470,96 +1503,243 @@ int cpu_comm_init(int mode)
 		 * See also: cpu_comm_mem.c setCPUAppReady() 2s timeout on the
 		 * other-CPU wait (replacing the stock infinite msleep loop).
 		 */
-		if ((*mips_flag & 0x5) != 0x5) {
-			comm_SpinLock(3);
-			*mips_flag = (*mips_flag & ~0xFF) | 0x5;  /* Clean low byte, set READY + APP_READY */
-			comm_SpinUnLock(3, 0);
-			pr_info("cpu_comm: MIPS READY+APP_READY force-set from ARM (stock never sets it). flag=0x%x\n",
-				*mips_flag);
-		}
+		/* DISABLED 2026-04-18: Do not force MIPS flag to 0x5 from ARM.
+		 * Let MIPS drive its own state. Recovery-boot-from-stock showed
+		 * that masking the true flag value hides useful diagnostic info
+		 * and prevents observing partial-init states.
+		 *
+		 * if ((*mips_flag & 0x5) != 0x5) {
+		 *     comm_SpinLock(3);
+		 *     *mips_flag = (*mips_flag & ~0xFF) | 0x5;
+		 *     comm_SpinUnLock(3, 0);
+		 *     pr_info("cpu_comm: MIPS force-set ...\n");
+		 * }
+		 */
+		pr_info("cpu_comm: MIPS flag observed (no force-set) = 0x%x\n",
+			*mips_flag);
 
-		/* Auto-register known MIPS VP routes */
+		/* Register MIPS VP channels: all 16 comp_id nibbles at cpu=0x14.
+		 * channel_id = (comp_id & 0xF) | (cpu << 4) → 0x140..0x14F.
+		 * MIPS sends calls on 0x140; register all to cover every nibble.
+		 */
 		{
-			static const u32 mips_vp_ids[] = {
-				0x8B109F04, 0x8B10A0E0, 0x8B10A0E8, 0x8B10A110,
-				0x8B10A138, 0x8B10A160, 0x8B10A188, 0x8B10A1EC,
-				0x8B10A218, 0x8B10A244, 0x8B109D20, 0x8B109D54,
-				0x8B109DC0, 0x8B109CD0, 0x8B109CF8, 0x8B109B48,
-				0x8B109B40, 0x8B109F7C,
-			};
+			void *cpool = (u8 *)pcpu_comm_dev + 0x30;
 			int j, ok = 0;
-			for (j = 0; j < ARRAY_SIZE(mips_vp_ids); j++) {
-				u8 rt[96];
-				memset(rt, 0, 96);
-				*(u16 *)(rt + 2) = 1;
-				*(u32 *)(rt + 8) = mips_vp_ids[j];
-				*(int *)(rt + 92) = -1;
-				if (AddInRoutine(rt) == 0)
+			for (j = 0; j < 16; j++) {
+				if (Comm_AddNewChannel(cpool, (u16)j, 0x14) == 0)
 					ok++;
 			}
-			pr_info("cpu_comm: auto-registered %d/%d MIPS VP routes\n",
-				ok, (int)ARRAY_SIZE(mips_vp_ids));
+			pr_info("cpu_comm: registered %d/16 MIPS VP channels (0x140..0x14F)\n", ok);
+		}
+
+		/* Register MIPS→ARM callback stubs (cpu_id=1=ARM, null callback).
+		 * MIPS uses these fn_ptrs as comp_id when calling ARM.
+		 * comm_CallWorkAction finds cpu_id=1, sends empty ack.
+		 */
+		{
+			static const u32 mips_arm_callbacks[] = {
+				0x8B109F04, /* THal_Vp_Init */
+				0x8B10A0E0, /* THal_Vp_Deinit */
+				0x8B10A0E8, /* THal_Vp_EnableBlackScreen */
+				0x8B10A110, /* THal_Vp_DisableBlackScreen */
+				0x8B10A138, /* THal_Vp_EnableVideoFreeze */
+				0x8B10A160, /* THal_Vp_DisableVideoFreeze */
+				0x8B10A188, /* THal_Vp_EnableScreenCover */
+				0x8B10A1EC, /* THal_Vp_DisableScreenCover */
+				0x8B10A218, /* THal_Vp_SetSource */
+				0x8B10A244, /* THal_Vp_GetSource */
+				0x8B109D20, /* THal_Vp_Wce_SetMirrorMode */
+				0x8B109D54, /* THal_Vp_Wce_SetWindow */
+				0x8B109DC0, /* THal_Vp_Wce_GetWindow */
+				0x8B109CD0, /* THal_Vp_SeamlessEnable */
+				0x8B109CF8, /* THal_Vp_SeamlessDisable */
+				0x8B109B48, /* THal_Vp_GetVBIData */
+				0x8B109B40, /* THal_Vp_GetSignalInfo */
+				0x8B109F7C, /* THal_Vp_RegisterSignalChangeCallback */
+			};
+			int k, rt_ok = 0;
+			for (k = 0; k < ARRAY_SIZE(mips_arm_callbacks); k++) {
+				u8 rt[96];
+				memset(rt, 0, 96);
+				*(u16 *)(rt + 2) = 1;                   /* cpu_id = ARM */
+				*(u32 *)(rt + 8) = mips_arm_callbacks[k]; /* comp_id = MIPS fn_ptr */
+				*(int *)(rt + 92) = -1;
+				if (AddInRoutine(rt) == 0)
+					rt_ok++;
+			}
+			pr_info("cpu_comm: registered %d/%d MIPS->ARM callbacks\n",
+				rt_ok, (int)ARRAY_SIZE(mips_arm_callbacks));
+		}
+
+		/* Pre-register ARM→MIPS routes (cpu_id=0=MIPS).
+		 * ARM uses these fn_ptrs as comp_id when calling MIPS.
+		 * FindRoutine returns dst_cpu=0 → SendComm2CPUEx routes via msgbox.
+		 */
+		{
+			static const u32 arm_mips_routes[] = {
+				0x8B10ABB8, /* THal_Vp_SetHDCP22Key */
+				0x8B10AC84, /* THal_Vp_TurnOnARCAudioPath */
+				0x8B10AD1C, /* THal_Vp_SetHDMIHotPlugByPortCallback */
+				0x8B10ACB4, /* THal_Vp_SwitchARCTXPath */
+				0x8B10ACE0, /* THal_Vp_HDMI_GetPortStatus */
+				0x8B10ABF8, /* THal_Vp_HDMI_SetPortMap */
+				0x8B10AC30, /* THal_Vp_HDMI_ReloadHdcp14Key */
+				0x8B10AC58, /* THal_Vp_HDMI_SetHPDTimeInterval */
+				0x8B10A4FC, /* THal_Vp_SetBrightness */
+				0x8B10A528, /* THal_Vp_GetBrightness */
+				0x8B10A558, /* THal_Vp_SetContrast */
+				0x8B10A584, /* THal_Vp_GetContrast */
+				0x8B10A5B4, /* THal_Vp_SetSaturation */
+				0x8B10A5E0, /* THal_Vp_GetSaturation */
+				0x8B10A610, /* THal_Vp_SetHue */
+				0x8B10A63C, /* THal_Vp_GetHue */
+				0x8B10A66C, /* THal_Vp_SetColorManagement */
+				0x8B10A6AC, /* THal_Vp_GetColorManagement */
+				0x8B10A6F4, /* THal_Vp_SetSharpness */
+				0x8B10A720, /* THal_Vp_GetSharpness */
+				0x8B10A750, /* THal_Vp_SetDCI */
+				0x8B10A77C, /* THal_Vp_GetDCI */
+				0x8B10A7AC, /* THal_Vp_SetBlackExtension */
+				0x8B10A7D8, /* THal_Vp_GetBlackExtension */
+				0x8B10A808, /* THal_Vp_SetTNR */
+				0x8B10A834, /* THal_Vp_GetTNR */
+				0x8B10A864, /* THal_Vp_SetSNR */
+				0x8B10A890, /* THal_Vp_GetSNR */
+				0x8B10A8C0, /* THal_Vp_SetPictureMode */
+				0x8B10A8EC, /* THal_Vp_GetPictureMode */
+				0x8B10A94C, /* THal_Vp_SetLowLatencyMode */
+				0x8B10A978, /* THal_Vp_GetLowLatencyMode */
+				0x8B10A91C, /* THal_Vp_GetDisplayLatency */
+				0x8B10A9A8, /* THal_Vp_RegisterCallbackOfDisplayLatencyChange */
+				0x8B10A9D8, /* THal_Vp_UnregisterCallbackOfDisplayLatencyChange */
+				0x8B10AA00, /* THal_Vp_SetWhiteBalance */
+				0x8B10AA40, /* THal_Vp_SetGamma */
+				0x8B10AB5C, /* THal_Vp_SetVideoRange */
+				0x8B10AB88, /* THal_Vp_GetVideoRange */
+				0x8B10A410, /* THal_Vp_SetBacklightWorkMode */
+				0x8B10A444, /* Thal_Vp_SetBacklightPwmInfo */
+				0x8B10A4C8, /* Thal_Vp_SetBacklightLevel */
+				0x8B10A274, /* THal_Vp_UnregisterSignalChangeCallback */
+				0x8B10A2A0, /* THal_Vp_AtvChannelScanStart */
+				0x8B10A2C8, /* THal_Vp_AtvChannelScanEnd */
+				0x8B10A2F0, /* THal_Vp_AtvChannelChange */
+				0x8B10A328, /* THal_Vp_AtvSetSignalStd */
+				0x8B10A354, /* THal_Vp_AtvSetRegion */
+				0x8B10A380, /* THal_Vp_AtvEnableSnowScreen */
+				0x8B10A3B0, /* Thal_Vp_AtvIsFastSyncLock */
+				0x8B10A3E0, /* THal_Vp_CvbsSetPedestalMode */
+				0x8B10AD68, /* THal_Vp_SetImageBufferAddr */
+				0x8B10AD70, /* THal_Vp_GetImageBufferAddr */
+				0x8B109E2C, /* THal_Vp_Wce_GetActiveWindow */
+				0x8B109E88, /* THal_Vp_Wce_EnablePixel2PixelMode */
+				0x8B109EDC, /* THal_Vp_Wce_DisablePixel2PixelMode */
+				0x8B109B90, /* THal_Vp_ResetVBI */
+				0x8B109BB8, /* THal_Vp_EnableVBILine */
+				0x8B109BF0, /* THal_Vp_GetVBIAddr */
+				0x8B109C20, /* THal_Vp_GetVBISize */
+				0x8B109C50, /* THal_Vp_GetVBIOffset */
+				0x8B109C80, /* THal_Vp_StopVBI */
+				0x8B109CA8, /* THal_Vp_StartVBI */
+			};
+			int k, rt_ok = 0;
+			for (k = 0; k < ARRAY_SIZE(arm_mips_routes); k++) {
+				u8 rt[96];
+				memset(rt, 0, 96);
+				*(u16 *)(rt + 2) = 0;                 /* cpu_id = MIPS */
+				*(u32 *)(rt + 8) = arm_mips_routes[k]; /* comp_id = MIPS fn_ptr */
+				*(int *)(rt + 92) = -1;
+				if (AddInRoutine(rt) == 0)
+					rt_ok++;
+			}
+			pr_info("cpu_comm: registered %d/%d ARM->MIPS routes\n",
+				rt_ok, (int)ARRAY_SIZE(arm_mips_routes));
 		}
 	}
 
 	/* Dump MIPS elog Mode 1 ring buffer (100KB at 0x4B272D9C) */
 	{
-		void __iomem *elog_ctl, *elog_buf;
+		void __iomem *elog_ctl;
+		void __iomem *elog_buf_m1 = NULL;
+		void __iomem *elog_buf_m2 = NULL;
 
 		elog_ctl = ioremap(0x4B48BE00, 0x500);
-		elog_buf = ioremap(0x4B272000, 0x20000);  /* 128KB covering ring buffer */
 
-		if (elog_ctl && elog_buf) {
-			u8 cur_mode = readb(elog_ctl + 0x9B);
-			u32 wp2 = readl(elog_ctl + 0x4B8);
+		if (elog_ctl) {
+			u8  cur_mode = readb(elog_ctl + 0x9B);
+			u32 wp2      = readl(elog_ctl + 0x4B8);
 
 			pr_info("cpu_comm: MIPS elog AFTER: mode=%u wp2=%u\n",
 				cur_mode, wp2);
 
-			/* Dump Mode 1 ring buffer content */
+			/* Dump whichever buffer this boot uses. Mode 1 = 120KB ring,
+			 * Mode 2 = 2 MB linear (wp2 tells us how much is written). */
 			{
 				char line[256];
-				u32 pos = 0x0D9C;  /* 0x4B272D9C - 0x4B272000 = offset into mapping */
-				u32 end = 0x1D9C0; /* ~100KB */
+				u32 pos, end, scan_cap;
 				int lpos = 0;
 				int lines_printed = 0;
+				void __iomem *buf;
+				const char *label;
 
-				pr_info("cpu_comm: === MIPS ELOG DUMP (Mode 1 ring buffer) ===\n");
-				while (pos < end && lines_printed < 200) {
-					u8 c = readb(elog_buf + pos);
-					pos++;
-					if (c == '\n' || lpos >= 250) {
-						line[lpos] = '\0';
-						if (lpos > 0) {
-							pr_info("MIPS: %s\n", line);
-							lines_printed++;
-						}
-						lpos = 0;
-					} else if (c >= 0x20 && c < 0x7F) {
-						line[lpos++] = c;
-					} else if (c == '\x1B') {
-						/* Skip ANSI escape sequences */
-						while (pos < end) {
-							c = readb(elog_buf + pos);
-							pos++;
-							if ((c >= 'A' && c <= 'Z') ||
-							    (c >= 'a' && c <= 'z'))
-								break;
+				if (cur_mode == 2) {
+					/* Mode 2: linear buffer at 0x4B28BD9C, up to 2 MB */
+					elog_buf_m2 = ioremap(0x4B28BD9C, 0x200000);
+					buf = elog_buf_m2;
+					pos = 0;
+					scan_cap = (wp2 && wp2 <= 0x200000) ? wp2 : 0x200000;
+					end = scan_cap;
+					label = "Mode 2 linear";
+				} else {
+					/* Mode 1: ring buffer at 0x4B272000 */
+					elog_buf_m1 = ioremap(0x4B272000, 0x20000);
+					buf = elog_buf_m1;
+					pos = 0x0D9C;
+					end = 0x1D9C0;
+					label = "Mode 1 ring buffer";
+				}
+
+				if (buf) {
+					pr_info("cpu_comm: === MIPS ELOG DUMP (%s, scan=%u bytes) ===\n",
+						label, end - pos);
+					while (pos < end && lines_printed < 200) {
+						u8 c = readb(buf + pos);
+						pos++;
+						if (c == '\n' || lpos >= 250) {
+							line[lpos] = '\0';
+							if (lpos > 0) {
+								pr_info("MIPS: %s\n", line);
+								lines_printed++;
+							}
+							lpos = 0;
+						} else if (c >= 0x20 && c < 0x7F) {
+							line[lpos++] = c;
+						} else if (c == '\x1B') {
+							/* Skip ANSI escape sequences */
+							while (pos < end) {
+								c = readb(buf + pos);
+								pos++;
+								if ((c >= 'A' && c <= 'Z') ||
+								    (c >= 'a' && c <= 'z'))
+									break;
+							}
 						}
 					}
+					if (lpos > 0) {
+						line[lpos] = '\0';
+						pr_info("MIPS: %s\n", line);
+					}
+					pr_info("cpu_comm: === END MIPS ELOG (%d lines) ===\n",
+						lines_printed);
+				} else {
+					pr_warn("cpu_comm: could not ioremap elog buffer for mode %u\n",
+						cur_mode);
 				}
-				if (lpos > 0) {
-					line[lpos] = '\0';
-					pr_info("MIPS: %s\n", line);
-				}
-				pr_info("cpu_comm: === END MIPS ELOG (%d lines) ===\n", lines_printed);
 			}
 		}
 
-		if (elog_buf)
-			iounmap(elog_buf);
-		if (elog_ctl)
-			iounmap(elog_ctl);
+		if (elog_buf_m1) iounmap(elog_buf_m1);
+		if (elog_buf_m2) iounmap(elog_buf_m2);
+		if (elog_ctl)    iounmap(elog_ctl);
 	}
 
 	/* Create proc entries */
@@ -1596,7 +1776,7 @@ err_hw:
 	cpu_comm_hw_cleanup();
 err_unmap:
 	if (vaddr)
-		vunmap(vaddr);
+		iounmap(vaddr);
 	ShMemAddrBase = 0;
 	ShMemAddrVir = 0;
 	return ret;
@@ -1654,7 +1834,7 @@ void cpu_comm_cleanup(void)
 	cpu_comm_hw_cleanup();
 
 	if (ShMemAddrBase) {
-		vunmap((void *)(unsigned long)ShMemAddrBase);
+		iounmap((void __iomem *)(unsigned long)ShMemAddrBase);
 		ShMemAddrBase = 0;
 		ShMemAddrVir = 0;
 	}
