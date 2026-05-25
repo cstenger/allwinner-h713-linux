@@ -109,7 +109,7 @@ Detail: [docs/subsystems/boot.md](docs/subsystems/boot.md).
 dts/                  Device-tree source (sun50i-h713-hy310.dts)
 dt-bindings/          Clock + reset ID headers for H713 CCU
 config/               Kernel defconfig, module autoload
-patches/              20 patches against vanilla linux-6.16.7
+patches/              21 patches against vanilla linux-6.16.7
 drivers/              Out-of-tree kernel modules
   audio/                Internal codec + CPU-DAI + machine
   cpu_comm/             ARM↔MIPS IPC driver

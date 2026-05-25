@@ -41,7 +41,7 @@ for p in $(cat /path/to/hy310-linux/patches/series); do
 done
 ```
 
-The patch set (20 patches, listed in `patches/series`):
+The patch set (21 patches, listed in `patches/series`):
 
 | Patch | Type | What it adds / changes |
 |---|---|---|
@@ -65,11 +65,12 @@ The patch set (20 patches, listed in `patches/series`):
 | `0021-media-sunxi-cir-add-h713-vendor-init.patch` | edit | IR receiver: H713 vendor init |
 | `0022-staging-cedrus-add-h713-ve3-clock-reset.patch` | edit | Cedrus: VE3 clock+reset support |
 | `0023-drm-add-sun50i-h713-hdmi-rx-driver.patch` | new | H713 HDMI-RX DRM driver (1068 LOC) + drm Kconfig/Makefile wiring |
+| `0024-soc-sunxi-add-msgbox-amp.patch` | new | sunxi-msgbox-amp mailbox RPMSG transport (694 LOC, `=y`) — the ARM↔MIPS IPC transport the out-of-tree `cpu_comm` requires |
 
 Numbering gaps (0012-0014) are intentional — those patches were abandoned
 during development.
 
-The patches add ~8800 lines of new H713-specific code and edit ~12 upstream
+The patches add ~9500 lines of new H713-specific code and edit ~14 upstream
 kernel files. After applying, the kernel tree builds with the
 `hy310_defconfig` we ship.
 
