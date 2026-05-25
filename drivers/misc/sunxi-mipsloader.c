@@ -789,6 +789,28 @@ static int mipsloader_probe(struct platform_device *pdev)
 		} else {
 			dev_info(&pdev->dev, "Share regs already set by U-Boot\n");
 		}
+
+		/*
+		 * Send doorbell via msgbox to trigger MIPS to re-read share regs.
+		 *
+		 * MIPS reads share regs only ONCE at boot. If the kernel clock
+		 * framework gated BUS_MIPS_CLK before MIPS read them, MIPS got
+		 * 0x0 and is stuck in a polling loop with ShStartAddr=0x0.
+		 * Writing to the msgbox FIFO triggers MIPS to re-read.
+		 *
+		 * Send unconditionally — even if regs were already set by U-Boot,
+		 * MIPS may have cached 0x0 from a brief clock-gated window.
+		 */
+		{
+			void __iomem *mbox = ioremap(0x03003000, 0x200);
+			if (mbox) {
+				writel(0x0001, mbox + 0x70);
+				dev_info(&pdev->dev, "Doorbell sent to MIPS via msgbox\n");
+				iounmap(mbox);
+			} else {
+				dev_warn(&pdev->dev, "Failed to map msgbox for doorbell\n");
+			}
+		}
 	}
 
 	/* Map MIPS memory region */
