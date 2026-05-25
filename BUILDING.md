@@ -181,3 +181,8 @@ python3 scripts/repack_boot.py \
 - [FLASHING.md](FLASHING.md) — flash the image to eMMC or boot from USB.
 - [ROOTFS.md](ROOTFS.md) — create a Debian rootfs with the modules
   pre-installed.
+- [userspace/](userspace/) — build the runtime daemons (`hy310-hdmird` for
+  HDMI-RX bring-up, `hy310-pqd` for picture quality). These are separate
+  cross-compiled C++ projects, not part of the kernel build.
+- [docs/subsystems/hdmi.md](docs/subsystems/hdmi.md#bringing-up-hdmi-input) —
+  bring up the HDMI input picture once the kernel + daemons are installed.

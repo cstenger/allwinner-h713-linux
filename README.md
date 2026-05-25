@@ -90,6 +90,8 @@ export KDIR=/path/to/linux-6.16.7
 ```
 
 Flash: [FLASHING.md](FLASHING.md). Rootfs: [ROOTFS.md](ROOTFS.md).
+Userspace daemons: [userspace/](userspace/). Bring up HDMI input:
+[docs/subsystems/hdmi.md](docs/subsystems/hdmi.md#bringing-up-hdmi-input).
 
 ## Boot architecture (one-line summary)
 
