@@ -28,7 +28,7 @@ armhf).  Dependencies: `g++-arm-linux-gnueabihf`, `libsqlite3-dev:armhf`.
 
 ```bash
 # Cross-compile (default)
-cd /opt/hy310/hy310-pqd
+cd userspace/hy310-pqd
 make
 
 # Native build on hy310 (requires g++, libsqlite3-dev)
@@ -56,7 +56,7 @@ build/test_pqconfig     config-parser test against stock files
 
 ```bash
 # From openclaw
-cd /opt/hy310/hy310-pqd
+cd userspace/hy310-pqd
 make deploy    # scp's binaries to hy310:/tmp/
 
 # On hy310 as root

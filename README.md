@@ -107,7 +107,7 @@ Detail: [docs/subsystems/boot.md](docs/subsystems/boot.md).
 dts/                  Device-tree source (sun50i-h713-hy310.dts)
 dt-bindings/          Clock + reset ID headers for H713 CCU
 config/               Kernel defconfig, module autoload
-patches/              8 patches against vanilla linux-6.16.7
+patches/              20 patches against vanilla linux-6.16.7
 drivers/              Out-of-tree kernel modules
   audio/                Internal codec + CPU-DAI + machine
   cpu_comm/             ARM↔MIPS IPC driver
@@ -124,6 +124,7 @@ tools/                MIPS elog reader, env analyzer, regression tests
 docs/                 Documentation (subsystems/ + re/)
 reference/            Stock-Android artifacts (DTB, GPIO map, kallsyms)
 firmware/             Vendor blobs (`hy310-edid.bin`, `hdcp_v22.bin`)
+userspace/            HDMI-RX + picture-quality daemons (hy310-hdmird, hy310-pqd)
 ```
 
 ## Userspace components on the device
@@ -134,9 +135,9 @@ heavy lifting at runtime:
 - **`hy310-hdmird`** — C++ daemon that replicates stock `tvserver`. Loads
   HDCP22 key, registers 9× `MipsHalCallback_*` routines, runs the 12-call
   init sequence, listens on `/run/hy310-hdmird.sock` for source-switch.
-  Source: `/opt/hy310/hy310-hdmird/`.
+  Source: [`userspace/hy310-hdmird/`](userspace/hy310-hdmird/).
 - **`hy310-pqd`** — picture-quality daemon. DE2 gamma works.
-  Source: `/opt/hy310/hy310-pqd/`.
+  Source: [`userspace/hy310-pqd/`](userspace/hy310-pqd/).
 - **`/usr/local/bin/decd_submit_test`** — exercises the `decd` ioctl path
   (mostly historical at this point — see [SESSIONS.md](SESSIONS.md)).
 

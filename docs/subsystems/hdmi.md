@@ -35,6 +35,54 @@ The picture **reaches the LVDS pipeline** but is **tiled 4×1 grayscale**:
 This is the active development front. See
 [docs/subsystems/display.md](display.md) for the path forward.
 
+## Bringing up HDMI input
+
+Step-by-step to get the HDMI input picture onto the projector.
+
+**Boot prerequisites (easy to miss):**
+
+- **Plug the HDMI source in *before* powering on.** Hotplug does not work —
+  the HPD plug/unplug IRQ (266) never fires, so a source connected after boot
+  is not detected.
+- **MIPS first boot is currently broken — reboot once.** On a cold start the
+  MIPS co-processor does not come up. Reboot to recover. If it still doesn't
+  come up, pull the **power cable** (a soft reboot does not reset MIPS; only a
+  power cycle does).
+
+**One-time persistent config** (`/etc/modprobe.d/`):
+
+```sh
+# h713_drm.conf
+options h713_drm mips_scanout_addr=0x4c3ef000 ch1_mode=1 plane_init_steps=0
+# blacklist-display.conf
+blacklist sunxi_ge2d
+```
+
+`sunxi_ge2d` must be blacklisted — it and `h713_drm` both bind the same
+`trix,ge2d` compatible and conflict.
+
+**After each boot:**
+
+```sh
+systemctl start labwc        # DRM master -> CRTC enable -> writes scanout addr
+hy310-hdmird --no-socket     # default --src 3 (= HDMI1) -> MIPS source switch
+```
+
+The HDMI source on the HY310 is wired to **HDMI1 = source 3** (not 5).
+`hy310-hdmird` defaults to `--src 3`. With the daemon running as a service,
+switch sources at runtime with `hy310-hdmi src 3`.
+
+**Channel mode → tiling** (the picture is tiled either way until the
+channel-format fix lands, see [display.md](display.md)):
+
+| modprobe option | result |
+|---|---|
+| `ch1_mode=1` (channel 1, XRGB) | 4× horizontal tiling — the usable baseline |
+| `ch0_mode=1` (channel 0) | 16× tiling |
+
+Use `ch1_mode=1` (and leave `ch0_mode=0`). Params are readable at
+`/sys/module/h713_drm/parameters/`.
+
 ## Hardware
 
 | Block | Address | Notes |
@@ -48,6 +96,28 @@ This is the active development front. See
 The H713 SoC also has a DW-HDMI **TX** block at `0x05010000`. **The
 HY310 board does not wire it to a connector** — DTS keeps it
 `status = "disabled"`.
+
+## Kernel driver
+
+The HDMI-RX block is driven by an in-tree DRM driver:
+
+- **Source**: `drivers/gpu/drm/sun50i-h713/sun50i-h713-hdmi-rx.c`
+- **Config**: `CONFIG_DRM_SUN50I_H713_HDMI_RX=y` (built-in)
+- **Patch**: `0023-drm-add-sun50i-h713-hdmi-rx-driver.patch`
+- **DTS node**: `hdmi_rx@5000000`, `compatible = "allwinner,sun50i-h713-hdmi-rx"`
+
+The ARM driver programs the EDID-RAM (Synopsys DMA path) and drives HPD,
+then leaves TMDS lock and the signal state machine to the MIPS co-processor.
+Userspace bring-up is orchestrated by the `hy310-hdmird` daemon over
+`cpu_comm`.
+
+> **Register-state caveat**: the "obvious" lock bits (`CMU_STATUS`,
+> `PHY_STATUS`, the port-state bits at `0x06840001`/`0x068401AB`) read **0
+> even when a signal is locked** — and they read 0 on stock firmware too, which
+> displays a picture fine. They are **not** the lock gate. The real lock
+> signal is the `MipsHalCallback_SignalChange(Para=3)` callback. Do not treat
+> those zeros as a TMDS-lock failure (this cost several sessions of
+> mis-diagnosis).
 
 ## EDID
 
@@ -106,7 +176,8 @@ EDID mechanism.
 
 ## hy310-hdmird daemon
 
-C++ ARM32 cross-compiled daemon at `/opt/hy310/hy310-hdmird/`.
+C++ ARM32 cross-compiled daemon, source in the repo at
+[`userspace/hy310-hdmird/`](../../userspace/hy310-hdmird/).
 Source: `main.cpp`, `cpucomm.cpp`, `hdmi_ctl.cpp`, `name2id.cpp`,
 `receiver.cpp`.
 

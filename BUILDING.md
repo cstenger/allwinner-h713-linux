@@ -41,7 +41,7 @@ for p in $(cat /path/to/hy310-linux/patches/series); do
 done
 ```
 
-The patch set (19 patches, listed in `patches/series`):
+The patch set (20 patches, listed in `patches/series`):
 
 | Patch | Type | What it adds / changes |
 |---|---|---|
@@ -52,9 +52,9 @@ The patch set (19 patches, listed in `patches/series`):
 | `0005-phy-sun4i-usb-add-h713-pmu-bit0-quirk.patch` | edit | USB PHY: PMU bit-0 quirk |
 | `0006-mmc-sunxi-add-h713-v5p3x-support.patch` | edit | sunxi-mmc: v5p3x DMA reset + clock doubling |
 | `0007-pwm-add-sun8i-8channel-driver.patch` | new | sun8i PWM 8-channel driver (468 LOC) |
-| `0008-misc-add-hy310-board-mgr.patch` | new | hy310-board-mgr (fan, NTC, GPIO, 1288 LOC) |
-| `0009-misc-add-hy310-keystone-motor.patch` | new | hy310-keystone-motor (925 LOC) |
-| `0010-misc-add-sunxi-mipsloader.patch` | new | sunxi-mipsloader (906 LOC) |
+| `0008-misc-add-hy310-board-mgr.patch` | new | hy310-board-mgr (fan, NTC, GPIO, 1295 LOC) |
+| `0009-misc-add-hy310-keystone-motor.patch` | new | hy310-keystone-motor (932 LOC) |
+| `0010-misc-add-sunxi-mipsloader.patch` | new | sunxi-mipsloader (1608 LOC) |
 | `0011-misc-add-sunxi-nsi.patch` | new | sunxi-nsi NSI-MBUS driver (441 LOC) |
 | `0015-misc-add-h713-driver-kconfig.patch` | edit | drivers/misc/Kconfig entries for above |
 | `0016-dt-bindings-add-h713-clock-reset-ids.patch` | new | dt-bindings clock+reset IDs (155 LOC) |
@@ -64,11 +64,12 @@ The patch set (19 patches, listed in `patches/series`):
 | `0020-pmdomain-add-h713-ppu-driver.patch` | new | H713 PPU power domain (287 LOC) |
 | `0021-media-sunxi-cir-add-h713-vendor-init.patch` | edit | IR receiver: H713 vendor init |
 | `0022-staging-cedrus-add-h713-ve3-clock-reset.patch` | edit | Cedrus: VE3 clock+reset support |
+| `0023-drm-add-sun50i-h713-hdmi-rx-driver.patch` | new | H713 HDMI-RX DRM driver (1068 LOC) + drm Kconfig/Makefile wiring |
 
 Numbering gaps (0012-0014) are intentional — those patches were abandoned
 during development.
 
-The patches add ~7000 lines of new H713-specific code and edit ~10 upstream
+The patches add ~8800 lines of new H713-specific code and edit ~12 upstream
 kernel files. After applying, the kernel tree builds with the
 `hy310_defconfig` we ship.
 

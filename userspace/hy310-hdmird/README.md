@@ -56,7 +56,7 @@ machine reaches Running state only after this sequence completes.
 ## Build
 
 ```
-cd /opt/hy310/hy310-hdmird
+cd userspace/hy310-hdmird
 make                     # cross-compile arm32
 make deploy              # scp to hy310 (mainline boot)
 ```

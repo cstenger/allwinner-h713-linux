@@ -93,6 +93,22 @@ stays 0 — plugging/unplugging an HDMI cable doesn't notify the kernel.
 
 **Workaround**: polling watcher (planned, not deployed).
 
+**Practical consequence**: the HDMI source must be connected **before** power
+-on. A source plugged in after boot is never detected.
+
+---
+
+### MIPS first boot fails — reboot required
+
+**Symptom**: on a cold start the MIPS co-processor does not come up, so the
+HDMI-RX / display path is dead.
+
+**Workaround**: reboot once. If MIPS still doesn't come up, pull the **power
+cable** — a soft reboot does not reset MIPS, only a full power cycle does.
+
+**Cause**: not yet root-caused (first-boot init/timing). Tracked for a later
+fix.
+
 ---
 
 ### EDID DMA-block write puzzle

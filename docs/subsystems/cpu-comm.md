@@ -141,7 +141,7 @@ These were all on the way to "working":
 
 ## Userspace clients
 
-`hy310-hdmird` is the main client. See `/opt/hy310/hy310-hdmird/src/`.
+`hy310-hdmird` is the main client. See [`userspace/hy310-hdmird/src/`](../../userspace/hy310-hdmird/src/).
 Architecture: open `/dev/cpu_comm`, mmap 5 MB shmem, load HDCP22 key
 into shmem, register 9× `MipsHalCallback_*` routines for ARM-side callback
 delivery, run 12-call init + 12-call source-switch sequence.

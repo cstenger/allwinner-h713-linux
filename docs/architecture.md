@@ -166,8 +166,8 @@ these.
 
 | Daemon | Source | Function |
 |---|---|---|
-| `hy310-hdmird` | `/opt/hy310/hy310-hdmird/` | Replicates stock tvserver init + source-switch |
-| `hy310-pqd` | `/opt/hy310/hy310-pqd/` | Picture-quality daemon |
+| `hy310-hdmird` | `userspace/hy310-hdmird/` | Replicates stock tvserver init + source-switch |
+| `hy310-pqd` | `userspace/hy310-pqd/` | Picture-quality daemon |
 
 Both use the kernel `cpu_comm` driver via `/dev/cpu_comm`. Both run via
 systemd.
