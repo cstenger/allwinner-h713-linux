@@ -107,10 +107,10 @@ Detail: [docs/subsystems/boot.md](docs/subsystems/boot.md).
 dts/                  Device-tree source (sun50i-h713-hy310.dts)
 dt-bindings/          Clock + reset ID headers for H713 CCU
 config/               Kernel defconfig, module autoload
-patches/              20 patches against vanilla linux-6.16.7
+patches/              21 patches against vanilla linux-6.16.7
+                      (incl. in-tree cpu_comm + msgbox IPC, patch 0024)
 drivers/              Out-of-tree kernel modules
   audio/                Internal codec + CPU-DAI + machine
-  cpu_comm/             ARM↔MIPS IPC driver
   decd/                 Mainline port of stock decd.ko (currently inactive)
   display/drm/          h713_drm DRM/KMS shim (active for limited scanout)
   display/ge2d/         Mainline port of stock ge2d_dev.ko (blacklisted — will become primary)

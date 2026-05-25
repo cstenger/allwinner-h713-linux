@@ -41,7 +41,7 @@ for p in $(cat /path/to/hy310-linux/patches/series); do
 done
 ```
 
-The patch set (20 patches, listed in `patches/series`):
+The patch set (21 patches, listed in `patches/series`):
 
 | Patch | Type | What it adds / changes |
 |---|---|---|
@@ -65,11 +65,12 @@ The patch set (20 patches, listed in `patches/series`):
 | `0021-media-sunxi-cir-add-h713-vendor-init.patch` | edit | IR receiver: H713 vendor init |
 | `0022-staging-cedrus-add-h713-ve3-clock-reset.patch` | edit | Cedrus: VE3 clock+reset support |
 | `0023-drm-add-sun50i-h713-hdmi-rx-driver.patch` | new | H713 HDMI-RX DRM driver (1068 LOC) + drm Kconfig/Makefile wiring |
+| `0024-soc-sunxi-add-cpu-comm-and-msgbox-ipc.patch` | new | ARM↔MIPS IPC: cpu_comm (=m) + msgbox AMP transport (=y), in drivers/soc/sunxi/ |
 
 Numbering gaps (0012-0014) are intentional — those patches were abandoned
 during development.
 
-The patches add ~8800 lines of new H713-specific code and edit ~12 upstream
+The patches add ~18,000 lines of new H713-specific code and edit ~14 upstream
 kernel files. After applying, the kernel tree builds with the
 `hy310_defconfig` we ship.
 
@@ -113,7 +114,10 @@ make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- -j$(nproc) zImage modules dtbs
 
 The build script handles this, but if you do it manually you need
 `KBUILD_EXTRA_SYMBOLS` to chain dependent modules. Order matters: `tvtop`
-exports symbols that `ge2d`, `decd`, and `cpu_comm` consume.
+exports symbols that `ge2d` and `decd` consume.
+
+(`cpu_comm` and its `msgbox` transport are built **in-tree**, not here — see
+the patch set above. They are not out-of-tree modules.)
 
 ```sh
 # 1. TVTOP (no dependencies)
@@ -134,9 +138,6 @@ make -C $KDIR M=$PWD/drivers/display/drm \
     ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- modules
 
 # 3. Independent modules
-make -C $KDIR M=$PWD/drivers/cpu_comm \
-    ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- modules
-
 make -C $KDIR M=$PWD/drivers/audio \
     ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- modules
 
