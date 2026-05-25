@@ -130,8 +130,13 @@ int AddInRoutine(void *data)
 	if (*(u32 *)(ShMemAddrBase + SHMEM_OFF_MAGIC2) != CPU_COMM_MAGIC)
 		return -EINVAL;
 
-	/* Keep cpu_id from user buffer (allows registering routes to MIPS) */
-	/* Was: *(u16 *)((u8 *)data + RT_CPU_OFF) = (u16)getCurCPUID(0); */
+	/* 2026-05-04 Y2 REVERTED: stock-pattern overwrite of entry+2 with
+	 * CurCPUID (= 0 for ARM) routed all calls to ARM-self → -EFAULT.
+	 * Mainline keeps user-supplied target_cpu so FindRoutine returns
+	 * dst_cpu=1 and SendComm2CPUEx routes to MIPS. Stock has a
+	 * different routing path (FindRoutineEx @ 0x5cfc, not RE'd here);
+	 * mainline uses the entry+2 field directly as dst_cpu. */
+	/* Was Y2: *(u16 *)((u8 *)data + RT_CPU_OFF) = (u16)getCurCPUID(0); */
 
 	comp_id = *(u32 *)((u8 *)data + RT_COMP_ID_OFF);
 	if (*(int *)rt_count_ptr() > RT_MAX_INDEX) {
@@ -164,6 +169,7 @@ int AddInRoutine(void *data)
 			if (*(u16 *)(rt_entry(cur_idx) + RT_CPU_OFF) > 1) {
 				pr_err("cpu_comm: AddInRoutine: corrupt entry at %d\n",
 				       cur_idx);
+				comm_SpinUnLock(2, 0);
 				return -EINVAL;
 			}
 			prev_idx = cur_idx;
@@ -173,6 +179,7 @@ int AddInRoutine(void *data)
 			if (cur_idx > RT_MAX_INDEX) {
 				pr_err("cpu_comm: AddInRoutine: chain index %d > max\n",
 				       cur_idx);
+				comm_SpinUnLock(2, 0);
 				return -EINVAL;
 			}
 		}
@@ -198,6 +205,7 @@ int AddInRoutine(void *data)
 						       "overflow %d has next!=%d\n",
 						       overflow_idx,
 						       rt_next(overflow_idx));
+						comm_SpinUnLock(2, 0);
 						return -EINVAL;
 					}
 					entry = rt_entry(overflow_idx);
@@ -517,7 +525,7 @@ int CPUComm_CallEx(int comp_id, int *params, u32 *result)
 	int i;
 	u16 dst_cpu;
 	u32 seq_base;
-	u32 wait_obj = 0;
+	u32 *wait_obj = NULL;
 	u32 session_ptr;
 	u16 *return_entry = NULL;
 
@@ -545,6 +553,14 @@ int CPUComm_CallEx(int comp_id, int *params, u32 *result)
 	/* Store param count in cmd_type field (offset 8) */
 	*(u16 *)(local_msg + 8) = (u16)param_count;
 
+	/*
+	 * HY310-fix: hint dst_cpu=1 (MIPS) in msg[2]. SendComm2CPUEx's
+	 * HY310-fix path uses this when routine_find_buf[2] is a thread_id
+	 * (>1) rather than a real cpu_id. Safe because this driver is
+	 * dedicated to ARM↔MIPS communication — MIPS is always the target.
+	 */
+	*(u16 *)(local_msg + 2) = 1;
+
 	/* Copy params into payload (offset 44..84 = 0x2C..0x54) */
 	for (i = 0; i < param_count; i++)
 		*(u32 *)(local_msg + 44 + 4 * i) = (u32)params[i + 1];
@@ -561,36 +577,65 @@ int CPUComm_CallEx(int comp_id, int *params, u32 *result)
 	}
 
 	/*
-	 * Now wait for the MIPS response.
-	 * SendComm2CPUEx allocated a wait object and stored the session_id.
-	 * We need to find it, wait on it, then get the return data.
+	 * HY310-fix (Option E): SendComm2CPUEx is a FULLY SYNCHRONOUS send.
+	 * Its internal sem_down_timeout on sem_ptr+16 (proto.c:437) blocks
+	 * until the msgbox RX dispatcher signals the ACK has arrived. On
+	 * ret == 0 here, the ACK has already been processed and the return
+	 * data is sitting in the return FIFO.
+	 *
+	 * The previous port did FindWaitBySessionId + sem_down_interruptible
+	 * on wait_obj+8 which was a SECOND synchronization on top of the one
+	 * inside SendComm2CPUEx.  Because MIPS answers in microseconds, the
+	 * dispatcher routinely completed all its bookkeeping (including
+	 * wait-object cleanup) before CallEx could even look up the wait obj,
+	 * producing "wait obj not found (session=0x...)" and -EINVAL.
+	 *
+	 * Root fix: trust SendComm2CPUEx's synchronization and go straight to
+	 * GetReturnbySessionId.  Single source of truth for ACK sync, zero
+	 * window for the race, no hacky workaround.
 	 */
 	session_ptr = *(u32 *)(local_msg + 12);  /* session_id field */
 	dst_cpu = *(u16 *)(local_msg + 2);       /* resolved destination CPU */
 	seq_base = getSeq(dst_cpu);
 
-	/* Find our wait object */
-	FindWaitBySessionId((void *)(seq_base + 40),
-			    session_ptr, (u32 **)&wait_obj);
-	if (!wait_obj) {
-		pr_err("cpu_comm: CPUComm_CallEx: wait obj not found (session=0x%x)\n",
-		       session_ptr);
-		return -EINVAL;
+	/*
+	 * HY310-fix 2026-04-22: wait for RETURN signal before reading return FIFO.
+	 *
+	 * SendComm2CPUEx only synchronises on sem_ptr+16 (CALL_ACK), which MIPS
+	 * signals BEFORE processing. RETURN arrives later. The handler in
+	 * command_action signals wait_obj+8 when the RETURN is in the FIFO.
+	 *
+	 * Without this wait: GetReturnbySessionId races with MIPS's AddReturn2Fifo
+	 * and frequently returns null, then ReleaseWaitComm frees a wait-obj that
+	 * the late-arriving RETURN handler still dereferences → use-after-free
+	 * and kernel-module memory corruption.
+	 *
+	 * wait_obj stays in the wait-list until the explicit GetWaitbySessionId
+	 * + ReleaseWaitComm at the end of this function — lookup is race-free.
+	 */
+	if (FindWaitBySessionId((void *)(seq_base + 40),
+				session_ptr, &wait_obj) == 0 && wait_obj) {
+		cpu_comm_sem_down_timeout((void *)((u32)wait_obj + 8),
+					  msecs_to_jiffies(500));
 	}
 
-	/* Wait for MIPS to respond (blocks until up() is called) */
-	ret = cpu_comm_sem_down_interruptible((void *)(wait_obj + 8));
-	if (ret) {
-		pr_err("cpu_comm: CPUComm_CallEx: interrupted waiting (session=0x%x)\n",
-		       session_ptr);
-		return -EINVAL;
-	}
-
-	/* Get the return message from the return FIFO */
+	/* Get the return message from the return FIFO.
+	 *
+	 * Stock semantic (IDA @ 0x59cc): always returns 0; *return_entry is
+	 * NULL when no matching session is in the list. We therefore do NOT
+	 * early-return on a NULL return_entry — the wait-entry release at
+	 * end-of-function must run unconditionally, otherwise the 20-slot
+	 * free-wait FIFO drains one entry per call. The earlier -ENODATA
+	 * skip (W-session) was masking the actual bug (mismatched release
+	 * target) and trading a kernel-MM corruption for a slow leak.
+	 */
 	ret = GetReturnbySessionId(session_ptr, dst_cpu, (u32 *)&return_entry);
 	if (ret) {
-		pr_err("cpu_comm: CPUComm_CallEx: return not found (session=0x%x)\n",
-		       session_ptr);
+		/* Stock returns 0 always; non-zero here means defensive failure
+		 * (e.g. invalid cpu). Skip release path — no entry was ever
+		 * allocated to match. */
+		pr_err("cpu_comm: CPUComm_CallEx: GetReturnbySessionId failed (session=0x%x ret=%d)\n",
+		       session_ptr, ret);
 		return -EFAULT;
 	}
 
@@ -619,15 +664,29 @@ int CPUComm_CallEx(int comp_id, int *params, u32 *result)
 			dst_cpu, session_ptr);
 	}
 
-	/* Clean up wait object */
+	/*
+	 * HY310-fix 2026-04-18: release the wait-object back to the free-wait
+	 * FIFO. The "Option E" theory that the RX dispatcher does this was
+	 * wrong — Stock's CPUComm_CallEx @ 0x10614 explicitly calls
+	 *
+	 *   GetWaitbySessionId(v16, v14, &v40);
+	 *   ReleaseWaitComm(v11);
+	 *
+	 * at end-of-call. Without this, the 20-entry wait pool drains one
+	 * entry per call and call 21 hangs in the
+	 * `do { GetFreeWaitComm; schedule; } while (!wait_ptr)` loop inside
+	 * SendComm2CPUEx. That was the bug we kept mis-diagnosing as a
+	 * call-slot leak.
+	 */
 	{
-		u32 wait_cleanup = 0;
+		u8  tmp_buf[WAIT_ENTRY_SIZE];
+		u32 wait_fifo_base = getSeq(dst_cpu) + 40;
 
-		GetWaitbySessionId((void *)(seq_base + 40),
-				   session_ptr, (u8 *)&wait_cleanup);
-		if (!wait_cleanup)
-			return -EINVAL;
-		ReleaseWaitComm(dst_cpu, wait_cleanup);
+		/* GetWaitbySessionId writes the wait-entry pointer into
+		 * tmp_buf[0..3] (see cpu_comm_channel.c line 376). */
+		if (GetWaitbySessionId((void *)wait_fifo_base,
+				       session_ptr, tmp_buf) == 0)
+			ReleaseWaitComm(dst_cpu, *(u32 *)tmp_buf);
 	}
 
 	return ret;
@@ -873,11 +932,22 @@ void comm_CallWorkAction(void *data)
 
 	/* Find the registered routine for this component */
 	if (FindRoutine(*(u32 *)(local_msg + 40), routine_info)) {
-		/* No routine found — log and discard */
-		pr_warn("cpu_comm: comm_CallWorkAction: no routine for comp 0x%x\n",
-			*(u32 *)(local_msg + 40));
+		/* No routine found — dump local_msg for diagnosis */
+		{
+			const u8 *m = (const u8 *)local_msg;
+			pr_warn("cpu_comm: no routine comp=0x%08x  msg[0..63]:\n",
+				*(u32 *)(local_msg + 40));
+			print_hex_dump(KERN_WARNING, "  msg: ", DUMP_PREFIX_OFFSET,
+				       16, 4, m, 64, false);
+		}
 		goto out_free;
 	}
+
+	/* DBG-CALLWORK-ENTRY 2026-05-07 */
+	pr_info("cpu_comm: CallWorkAction comp=0x%08x dst_cpu=%u pid=%u\n",
+		*(u32 *)(local_msg + 40),
+		(unsigned)*(u16 *)(routine_info + 2),
+		*(u32 *)(local_msg + 16));
 
 	/* Verify destination matches current CPU */
 	{
@@ -890,6 +960,12 @@ void comm_CallWorkAction(void *data)
 			return;
 		}
 	}
+
+	/* 2026-05-06 CC-night: also deliver this CALL to any open
+	 * /dev/cpu_comm fd so userspace can observe MIPS->ARM callbacks
+	 * (MipsHalCallback_SignalChange, HotPlug, etc). The kernel-side
+	 * dispatch below still ACKs MIPS — userspace cannot inhibit it. */
+	cpu_comm_userspace_deliver(local_msg);
 
 	/* Call the registered routine callback.
 	 *
@@ -934,6 +1010,12 @@ void comm_CallWorkAction(void *data)
 				if (SendComm2CPUEx((u32)local_msg, 1, 0))
 					pr_warn("cpu_comm: comm_CallWorkAction: "
 						"SendComm2CPUEx failed\n");
+			}
+		} else {
+			/* No callback registered — send empty ack so MIPS doesn't hang */
+			if (!(local_msg[6] & 1) || (local_msg[6] & 2)) {
+				if (SendComm2CPUEx((u32)local_msg, 1, 0))
+					pr_warn_ratelimited("cpu_comm: null-cb ack failed\n");
 			}
 		}
 	}

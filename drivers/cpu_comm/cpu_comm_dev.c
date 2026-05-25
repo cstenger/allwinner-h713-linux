@@ -55,6 +55,8 @@
 #include <linux/delay.h>
 #include <linux/of_irq.h>
 #include <linux/cacheflush.h>
+#include <linux/clk.h>
+#include <linux/reset.h>
 #include "cpu_comm.h"
 
 #define DEVICE_NAME	"cpu_comm"
@@ -69,20 +71,21 @@ int cpu_comm_suspend_flag;
 
 static struct device *cpu_comm_mbox_dev;
 
-/* Global waitqueue for custom counting semaphore (BUG-19 fix) */
-DECLARE_WAIT_QUEUE_HEAD(cpu_comm_sem_wq);
+/* 2026-05-04 Y2: cpu_comm_sem_wq removed — switched to Linux struct
+ * semaphore primitives (down/up). See cpu_comm.h. */
 
 /* ── File operations ───────────────────────────────────────── */
 
 int cpu_comm_open(struct inode *inode, struct file *file)
 {
 	pr_debug("cpu_comm: open by pid %d\n", current->pid);
-	return 0;
+	return cpu_comm_user_open(inode, file);
 }
 
 static int cpu_comm_release(struct inode *inode, struct file *file)
 {
 	pr_debug("cpu_comm: close by pid %d\n", current->pid);
+	cpu_comm_user_release(file);
 	/* Clean up routines for this PID */
 	RemovePidRoutines(current->pid);
 	return 0;
@@ -242,15 +245,65 @@ long cpu_comm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	}
 
-	case IOCTL_INSTALL_RT:
+	case IOCTL_INSTALL_RT: {
+		u32 channel_id;
+		u32 existing = 0;
+
 		if (copy_from_user(buf, (void __user *)arg, 96))
 			return -EFAULT;
 		ret = AddInRoutine(buf);
 		if (ret)
 			return -EFAULT;
+
+		/* 2026-05-05 Y2: Stock IOCTL_INSTALL_RT (IDA @ 0x1518) calls
+		 * Comm_AddNewChannel after AddInRoutine. Without this, MIPS's
+		 * Comm_Add2NewCallFifo computes ChanPID=(buf[0]&0xF)|(16*buf[1])
+		 * for incoming CALLs, looks it up in the channel pool, finds
+		 * nothing → "no channel for id 0xXXXX" → CALL_ACK sent but
+		 * no dispatch → no RETURN. Symptom: hdmird's THal_Vp_Init hangs
+		 * with only ACK, never RETURN. */
+		channel_id = (buf[0] & 0xF) | (16 * buf[1]);
+		if (Comm_QueryChannel((u8 *)pcpu_comm_dev + 0x30,
+				      channel_id, &existing) == 0 && !existing) {
+			Comm_AddNewChannel((u8 *)pcpu_comm_dev + 0x30,
+					   (u16)buf[0], buf[1]);
+			buf[22] = channel_id;
+		}
+
+		/* 2026-05-06 CC-night v2: MIPS-incoming channel.
+		 *
+		 * Hexdump RE: when MIPS sends a CALL back to ARM (e.g.
+		 * MipsHalCallback_SignalChange) it fills call_entry+2 with its
+		 * own cpu_id (=1) and call_entry+16 with the destination ARM
+		 * userspace PID. Comm_Add2NewCallFifo then looks up channel_id
+		 * = (1 & 0xF) | (PID << 4) = 0x..01.
+		 *
+		 * Our existing AddNewChannel call uses channel-field of the
+		 * routine descriptor (= 0 for hdmird's MipsHalCallback_*) and
+		 * registers channel_id 0x..00 instead — off by one in the low
+		 * nibble. Add a MIPS-keyed channel for ARM-implementation
+		 * routines (reserved0 == 0) so MIPS->ARM callbacks dispatch.
+		 *
+		 * `reserved0` (= target_cpu) is the high half of buf[0]; in
+		 * little-endian the bytes are [channel_lo, channel_hi,
+		 * reserved0_lo, reserved0_hi] so reserved0 lives at bits 16..31. */
+		if (((buf[0] >> 16) & 0xFFFF) == 0) {
+			const u32 mips_cpu = 1;
+			u32 mips_channel = mips_cpu | ((u32)current->pid << 4);
+			u32 mips_existing = 0;
+			if (Comm_QueryChannel((u8 *)pcpu_comm_dev + 0x30,
+					      mips_channel, &mips_existing) == 0 && !mips_existing) {
+				Comm_AddNewChannel((u8 *)pcpu_comm_dev + 0x30,
+						   (u16)mips_cpu, (u32)current->pid);
+				pr_info("cpu_comm: MIPS-incoming channel reg pid=%d id=0x%x\n",
+					current->pid, mips_channel);
+			}
+		}
+
 		if (copy_to_user((void __user *)arg, buf, 96))
 			return -EFAULT;
 		break;
+	}
 
 	case IOCTL_UNINSTALL_RT:
 		if (copy_from_user(buf, (void __user *)arg, 96))
@@ -299,6 +352,8 @@ static const struct file_operations cpu_comm_fops = {
 	.release	= cpu_comm_release,
 	.unlocked_ioctl	= cpu_comm_ioctl,
 	.mmap		= cpu_comm_mmap,
+	.read		= cpu_comm_user_read,
+	.poll		= cpu_comm_user_poll,
 };
 
 /* ══════════════════════════════════════════════════════════════
@@ -1152,42 +1207,34 @@ int cpu_comm_init(int mode)
 		readl(vaddr + 0x90), readl(vaddr + 0x75B8));
 
 	/*
-	 * SELECTIVE WIPE.
-	 *
-	 * Zero out SharedMem EXCEPT the 4 critical 4-byte words:
-	 *   magic1 @ 0x0090
-	 *   ARM_flag @ 0x4CDC
-	 *   MIPS_flag @ 0x4CE0
-	 *   magic2 @ 0x75B8
-	 *
-	 * Wiping garbage 0xffffffff from routing table, message pool, SMM
-	 * metadata etc. prevents MIPS-FW from reading poisoned state and
-	 * looping in "Wait CPUNoticeReqed". Preserving magics + flags keeps
-	 * the U-Boot/MIPS handshake intact.
-	 *
-	 * Range 1: [0x0000, 0x008F]                       before magic1
-	 * Range 2: [0x0094, 0x4CDB]                       between magic1 and ARM_flag
-	 * Range 3: [0x4CE4, 0x75B7]                       between MIPS_flag and magic2
-	 * Range 4: [0x75BC, SHMEM_OFF_SMM_HEAP - 1]       after magic2, before SMM heap
+	 * SELECTIVE WIPE — DISABLED 2026-05-03 (session 20260503-X).
+	 * Original purpose: zero SharedMem garbage at probe time to prevent
+	 * MIPS-FW from looping on poisoned state. Hypothesis being tested:
+	 * stock-vendor cpu_comm_dev.ko does NOT do this aggressive wipe, and
+	 * the wipe-during-MIPS-init race may be what triggers MIPS to spawn
+	 * 7+ worker threads that hammer hwlocks[0] forever (mainline elog
+	 * shows this spam, stock does not). MIPS state-machine stuck @ Idle.
+	 * If disabling fixes the spam → wipe was harmful. Re-enable behind
+	 * #if if MIPS handshake breaks instead.
 	 */
+#if 0
 	{
 		u32 magic1 = readl(vaddr + SHMEM_OFF_MAGIC1);
 		u32 magic2 = readl(vaddr + SHMEM_OFF_MAGIC2);
 
-		/* Range 1: 0x00 .. 0x8F (before magic1) */
 		memset_io(vaddr, 0, SHMEM_OFF_MAGIC1);
-		/* Range 2: 0x94 .. 0x4CDB (between magic1 and ARM_flag) */
 		memset_io(vaddr + SHMEM_OFF_MAGIC1 + 4, 0,
 			  0x4CDC - (SHMEM_OFF_MAGIC1 + 4));
-		/* Range 3: 0x4CE4 .. 0x75B7 (between MIPS_flag and magic2) */
 		memset_io(vaddr + 0x4CE4, 0, SHMEM_OFF_MAGIC2 - 0x4CE4);
-		/* Range 4: 0x75BC .. (SHMEM_OFF_SMM_HEAP - 1) */
 		memset_io(vaddr + SHMEM_OFF_MAGIC2 + 4, 0,
 			  SHMEM_OFF_SMM_HEAP - (SHMEM_OFF_MAGIC2 + 4));
 
 		pr_info("cpu_comm: SELECTIVE WIPE done — magics preserved: magic1=0x%x magic2=0x%x\n",
 			magic1, magic2);
 	}
+#else
+	pr_info("cpu_comm: SELECTIVE WIPE skipped (test 20260503-X)\n");
+#endif
 
 	ret = cpu_comm_hw_init();
 	if (ret)
@@ -1403,6 +1450,14 @@ int cpu_comm_init(int mode)
 			}
 		}
 		pr_info("cpu_comm: %d/3 msgbox IRQs registered\n", total);
+
+		/*
+		 * Only arm the polling fallback if no IRQ line was usable.
+		 * A single registered IRQ still sees every Port-1 RX event
+		 * because all three GIC lines share the same FIFO-drain handler.
+		 */
+		if (total == 0)
+			cpu_comm_msgbox_start_polling((void *)cpu_comm_msg_cb);
 	}
 
 	/*
@@ -1449,74 +1504,52 @@ int cpu_comm_init(int mode)
 		}
 
 		/*
-		 * Wait for MIPS to process and log, then dump elog buffer.
-		 * The MIPS should see ARM READY+APP_READY and continue its
-		 * init, logging through Mode 2 (2MB buffer).
+		 * 2026-04-22: Real handshake instead of msleep + force-set.
+		 * Wait for MIPS to complete its InitCommMem (which runs
+		 * InitCommSeqMem(0)+(1) and inits the per-cpu sems at
+		 * 0x8B253120 / 0x8B2535B0) then sets its own READY bit.
+		 *
+		 * Previous workaround (force-set *mips_flag = 0x5) made MIPS
+		 * skip its sem-init because its own isCPUReady(MIPS) check
+		 * returned true at the start of InitCommMem. Result: BG_Thread
+		 * hung on first call inside Comm_ReleaseFreeCall's sem_get.
 		 */
-		msleep(500);
+		{
+			u32 waited = 0;
+			const u32 TIMEOUT_MS = 5000;
+			const u32 STEP_MS    = 10;
+
+			while ((*mips_flag & 0x1) == 0 && waited < TIMEOUT_MS) {
+				msleep(STEP_MS);
+				waited += STEP_MS;
+			}
+			if (*mips_flag & 0x1) {
+				mips_app_ready_assumed = 1;
+				pr_info("cpu_comm: MIPS READY after %u ms (flag=0x%x)\n",
+					waited, *mips_flag);
+			} else {
+				pr_err("cpu_comm: TIMEOUT waiting for MIPS READY after %u ms (flag=0x%x)\n",
+				       TIMEOUT_MS, *mips_flag);
+			}
+		}
 
 		pr_info("cpu_comm: POST-WAIT: ARM=0x%x MIPS=0x%x\n",
 			*arm_flag, *mips_flag);
 
-		/* Re-check MIPS READY after wait */
-		if (!mips_app_ready_assumed && (*mips_flag & 0x1)) {
-			mips_app_ready_assumed = 1;
-			pr_info("cpu_comm: MIPS app-ready assumed (MIPS READY seen after wait)\n");
-		}
-
 		/*
-		 * Force-set MIPS READY + APP_READY from ARM side.
+		 * 2026-04-22: force-set of *mips_flag = 0x5 REMOVED.
 		 *
-		 * Background: In the stock Allwinner H713 firmware, the MIPS
-		 * coprocessor (running display.bin) NEVER sets APP_READY (BIT2)
-		 * on its own CPU flag word at SharedMem + 0x4CE0.
+		 * Previous behaviour (force-write from ARM) corrupted the init
+		 * handshake: MIPS's InitCommMem reads its own isCPUReady(MIPS)
+		 * before running InitCommSeqMem(). With the flag already 0x5
+		 * (forced by us before MIPS could boot), MIPS thought it was
+		 * already initialized and skipped all per-cpu sem setup. The
+		 * sems at 0x8B253120 / 0x8B2535B0 stayed uninitialized and the
+		 * BG_Thread hung on its first call inside Comm_ReleaseFreeCall.
 		 *
-		 * Evidence from stock binary analysis (display.bin, 1.2MB MIPS32-LE):
-		 *
-		 *   1. display.bin setCPUAppReady equivalent (file offset 0x1a440):
-		 *      - LW/ORI/SW at offset 0x4CDC (= CPU_FLAG_OFFSET(0) = ARM flag)
-		 *      - Sets BIT(0) READY, clears BIT(1) NOT_READY, clears BIT(3) NOTICE_REQ
-		 *      - All writes go to 0x4CDC (ARM flag), NOT 0x4CE0 (MIPS flag)
-		 *      - BIT(2) APP_READY is NEVER set anywhere in display.bin
-		 *
-		 *   2. display.bin only reads 0x4CE0 (MIPS flag) ONCE (offset 0x1af04):
-		 *      - LW + ANDI 0x8 = checks NOTICE_REQ (BIT3) only
-		 *      - No writes to 0x4CE0 exist in the entire 1.2MB binary
-		 *
-		 *   3. Stock ARM driver setCPUAppReady (cpu_comm_dev.ko @ 0x4f28):
-		 *      - Sets BIT(2) on own flag, then waits on other CPU's BIT(2)
-		 *      - BUG: wait loop reads [r5+0xcdc] = hardcoded ARM flag (0x4CDC)
-		 *        regardless of cpu_id. ARM waits on ITS OWN flag, not MIPS.
-		 *      - For ARM (cpu_id=0): sets APP_READY, waits on self = returns
-		 *        immediately. MIPS APP_READY is never actually checked.
-		 *      - Stock error paths: 6x while(1) infinite loops (not BUG())
-		 *      - Stock APP_READY wait: while(!flag) msleep(1) with NO timeout
-		 *
-		 * Conclusion: MIPS APP_READY was never functional in stock firmware.
-		 * The stock system worked because ARM never checked MIPS APP_READY
-		 * (due to the hardcoded 0x4CDC bug in the wait loop). Our mainline
-		 * driver correctly checks the other CPU's flag (cpu_id ^ 1), which
-		 * means isCPUAppReady(MIPS) would always return false without this
-		 * force-set. Setting both READY and APP_READY here matches the
-		 * effective stock behavior where MIPS readiness was always assumed.
-		 *
-		 * See also: cpu_comm_mem.c setCPUAppReady() 2s timeout on the
-		 * other-CPU wait (replacing the stock infinite msleep loop).
+		 * Now we just WAIT for MIPS to set its own flag above, which
+		 * happens after its InitCommSeqMem completes.
 		 */
-		/* DISABLED 2026-04-18: Do not force MIPS flag to 0x5 from ARM.
-		 * Let MIPS drive its own state. Recovery-boot-from-stock showed
-		 * that masking the true flag value hides useful diagnostic info
-		 * and prevents observing partial-init states.
-		 *
-		 * if ((*mips_flag & 0x5) != 0x5) {
-		 *     comm_SpinLock(3);
-		 *     *mips_flag = (*mips_flag & ~0xFF) | 0x5;
-		 *     comm_SpinUnLock(3, 0);
-		 *     pr_info("cpu_comm: MIPS force-set ...\n");
-		 * }
-		 */
-		pr_info("cpu_comm: MIPS flag observed (no force-set) = 0x%x\n",
-			*mips_flag);
 
 		/* Register MIPS VP channels: all 16 comp_id nibbles at cpu=0x14.
 		 * channel_id = (comp_id & 0xF) | (cpu << 4) → 0x140..0x14F.
@@ -1532,128 +1565,17 @@ int cpu_comm_init(int mode)
 			pr_info("cpu_comm: registered %d/16 MIPS VP channels (0x140..0x14F)\n", ok);
 		}
 
-		/* Register MIPS→ARM callback stubs (cpu_id=1=ARM, null callback).
-		 * MIPS uses these fn_ptrs as comp_id when calling ARM.
-		 * comm_CallWorkAction finds cpu_id=1, sends empty ack.
+		/* HY310 2026-04-22 (session K cleanup):
+		 * ARM-side pre-registration of MIPS routes was attempted in earlier
+		 * sessions (CRC32 hash entries + fn_ptr callback entries) but
+		 * collided with MIPS's own registration via hal_adapter_init on the
+		 * shared 1224-slot routing table → MIPS crashed on the first call.
+		 *
+		 * Design now: MIPS owns the routing table. Userspace clients install
+		 * their own proxy entries on-demand via ioctl INSTALL_RT
+		 * (cpu_comm_ioctl → AddInRoutine). Example: hy310-pqd's kMipsRoutines
+		 * list (81 entries) registers ARM-side stubs for all HAL routines.
 		 */
-		{
-			static const u32 mips_arm_callbacks[] = {
-				0x8B109F04, /* THal_Vp_Init */
-				0x8B10A0E0, /* THal_Vp_Deinit */
-				0x8B10A0E8, /* THal_Vp_EnableBlackScreen */
-				0x8B10A110, /* THal_Vp_DisableBlackScreen */
-				0x8B10A138, /* THal_Vp_EnableVideoFreeze */
-				0x8B10A160, /* THal_Vp_DisableVideoFreeze */
-				0x8B10A188, /* THal_Vp_EnableScreenCover */
-				0x8B10A1EC, /* THal_Vp_DisableScreenCover */
-				0x8B10A218, /* THal_Vp_SetSource */
-				0x8B10A244, /* THal_Vp_GetSource */
-				0x8B109D20, /* THal_Vp_Wce_SetMirrorMode */
-				0x8B109D54, /* THal_Vp_Wce_SetWindow */
-				0x8B109DC0, /* THal_Vp_Wce_GetWindow */
-				0x8B109CD0, /* THal_Vp_SeamlessEnable */
-				0x8B109CF8, /* THal_Vp_SeamlessDisable */
-				0x8B109B48, /* THal_Vp_GetVBIData */
-				0x8B109B40, /* THal_Vp_GetSignalInfo */
-				0x8B109F7C, /* THal_Vp_RegisterSignalChangeCallback */
-			};
-			int k, rt_ok = 0;
-			for (k = 0; k < ARRAY_SIZE(mips_arm_callbacks); k++) {
-				u8 rt[96];
-				memset(rt, 0, 96);
-				*(u16 *)(rt + 2) = 1;                   /* cpu_id = ARM */
-				*(u32 *)(rt + 8) = mips_arm_callbacks[k]; /* comp_id = MIPS fn_ptr */
-				*(int *)(rt + 92) = -1;
-				if (AddInRoutine(rt) == 0)
-					rt_ok++;
-			}
-			pr_info("cpu_comm: registered %d/%d MIPS->ARM callbacks\n",
-				rt_ok, (int)ARRAY_SIZE(mips_arm_callbacks));
-		}
-
-		/* Pre-register ARM→MIPS routes (cpu_id=0=MIPS).
-		 * ARM uses these fn_ptrs as comp_id when calling MIPS.
-		 * FindRoutine returns dst_cpu=0 → SendComm2CPUEx routes via msgbox.
-		 */
-		{
-			static const u32 arm_mips_routes[] = {
-				0x8B10ABB8, /* THal_Vp_SetHDCP22Key */
-				0x8B10AC84, /* THal_Vp_TurnOnARCAudioPath */
-				0x8B10AD1C, /* THal_Vp_SetHDMIHotPlugByPortCallback */
-				0x8B10ACB4, /* THal_Vp_SwitchARCTXPath */
-				0x8B10ACE0, /* THal_Vp_HDMI_GetPortStatus */
-				0x8B10ABF8, /* THal_Vp_HDMI_SetPortMap */
-				0x8B10AC30, /* THal_Vp_HDMI_ReloadHdcp14Key */
-				0x8B10AC58, /* THal_Vp_HDMI_SetHPDTimeInterval */
-				0x8B10A4FC, /* THal_Vp_SetBrightness */
-				0x8B10A528, /* THal_Vp_GetBrightness */
-				0x8B10A558, /* THal_Vp_SetContrast */
-				0x8B10A584, /* THal_Vp_GetContrast */
-				0x8B10A5B4, /* THal_Vp_SetSaturation */
-				0x8B10A5E0, /* THal_Vp_GetSaturation */
-				0x8B10A610, /* THal_Vp_SetHue */
-				0x8B10A63C, /* THal_Vp_GetHue */
-				0x8B10A66C, /* THal_Vp_SetColorManagement */
-				0x8B10A6AC, /* THal_Vp_GetColorManagement */
-				0x8B10A6F4, /* THal_Vp_SetSharpness */
-				0x8B10A720, /* THal_Vp_GetSharpness */
-				0x8B10A750, /* THal_Vp_SetDCI */
-				0x8B10A77C, /* THal_Vp_GetDCI */
-				0x8B10A7AC, /* THal_Vp_SetBlackExtension */
-				0x8B10A7D8, /* THal_Vp_GetBlackExtension */
-				0x8B10A808, /* THal_Vp_SetTNR */
-				0x8B10A834, /* THal_Vp_GetTNR */
-				0x8B10A864, /* THal_Vp_SetSNR */
-				0x8B10A890, /* THal_Vp_GetSNR */
-				0x8B10A8C0, /* THal_Vp_SetPictureMode */
-				0x8B10A8EC, /* THal_Vp_GetPictureMode */
-				0x8B10A94C, /* THal_Vp_SetLowLatencyMode */
-				0x8B10A978, /* THal_Vp_GetLowLatencyMode */
-				0x8B10A91C, /* THal_Vp_GetDisplayLatency */
-				0x8B10A9A8, /* THal_Vp_RegisterCallbackOfDisplayLatencyChange */
-				0x8B10A9D8, /* THal_Vp_UnregisterCallbackOfDisplayLatencyChange */
-				0x8B10AA00, /* THal_Vp_SetWhiteBalance */
-				0x8B10AA40, /* THal_Vp_SetGamma */
-				0x8B10AB5C, /* THal_Vp_SetVideoRange */
-				0x8B10AB88, /* THal_Vp_GetVideoRange */
-				0x8B10A410, /* THal_Vp_SetBacklightWorkMode */
-				0x8B10A444, /* Thal_Vp_SetBacklightPwmInfo */
-				0x8B10A4C8, /* Thal_Vp_SetBacklightLevel */
-				0x8B10A274, /* THal_Vp_UnregisterSignalChangeCallback */
-				0x8B10A2A0, /* THal_Vp_AtvChannelScanStart */
-				0x8B10A2C8, /* THal_Vp_AtvChannelScanEnd */
-				0x8B10A2F0, /* THal_Vp_AtvChannelChange */
-				0x8B10A328, /* THal_Vp_AtvSetSignalStd */
-				0x8B10A354, /* THal_Vp_AtvSetRegion */
-				0x8B10A380, /* THal_Vp_AtvEnableSnowScreen */
-				0x8B10A3B0, /* Thal_Vp_AtvIsFastSyncLock */
-				0x8B10A3E0, /* THal_Vp_CvbsSetPedestalMode */
-				0x8B10AD68, /* THal_Vp_SetImageBufferAddr */
-				0x8B10AD70, /* THal_Vp_GetImageBufferAddr */
-				0x8B109E2C, /* THal_Vp_Wce_GetActiveWindow */
-				0x8B109E88, /* THal_Vp_Wce_EnablePixel2PixelMode */
-				0x8B109EDC, /* THal_Vp_Wce_DisablePixel2PixelMode */
-				0x8B109B90, /* THal_Vp_ResetVBI */
-				0x8B109BB8, /* THal_Vp_EnableVBILine */
-				0x8B109BF0, /* THal_Vp_GetVBIAddr */
-				0x8B109C20, /* THal_Vp_GetVBISize */
-				0x8B109C50, /* THal_Vp_GetVBIOffset */
-				0x8B109C80, /* THal_Vp_StopVBI */
-				0x8B109CA8, /* THal_Vp_StartVBI */
-			};
-			int k, rt_ok = 0;
-			for (k = 0; k < ARRAY_SIZE(arm_mips_routes); k++) {
-				u8 rt[96];
-				memset(rt, 0, 96);
-				*(u16 *)(rt + 2) = 0;                 /* cpu_id = MIPS */
-				*(u32 *)(rt + 8) = arm_mips_routes[k]; /* comp_id = MIPS fn_ptr */
-				*(int *)(rt + 92) = -1;
-				if (AddInRoutine(rt) == 0)
-					rt_ok++;
-			}
-			pr_info("cpu_comm: registered %d/%d ARM->MIPS routes\n",
-				rt_ok, (int)ARRAY_SIZE(arm_mips_routes));
-		}
 	}
 
 	/* Dump MIPS elog Mode 1 ring buffer (100KB at 0x4B272D9C) */
@@ -1744,6 +1666,10 @@ int cpu_comm_init(int mode)
 
 	/* Create proc entries */
 	cpu_comm_proc_init();
+
+	/* Y2 2026-05-04: pre-init queueAction work_structs so the lazy-init
+	 * race in IRQ-context can't happen. */
+	cpu_comm_init_action_work();
 
 	pr_info("cpu_comm: initialized (ShMem=0x%x, %u bytes)\n",
 		ShMemAddr, ShMemSize);
@@ -1849,7 +1775,49 @@ static int cpu_comm_drv_probe(struct platform_device *pdev)
 	struct device_node *np = pdev->dev.of_node;
 	struct device_node *mem_node;
 	struct reserved_mem *rmem;
+	struct clk *mbox_clk;
+	struct reset_control *mbox_rst;
 	int ret;
+
+	/*
+	 * HY310-fix 2026-04-18: Claim msgbox clock + reset.
+	 *
+	 * DTS declares clocks=<&ccu CLK_BUS_MSGBOX> and resets=<&ccu RST_BUS_MSGBOX>
+	 * but the previous probe never called clk_prepare_enable() nor
+	 * reset_control_deassert(). Hardware ran on U-Boot residual config —
+	 * Version register (0x3003010) returned 0x00020000 (read path alive)
+	 * but writes to IRQ_EN (0x420) silently dropped (readback = 0).
+	 *
+	 * Without deassert, the msgbox control-register write path can stay
+	 * in reset from the perspective of the AXI peripheral bridge.
+	 */
+	mbox_clk = devm_clk_get_enabled(&pdev->dev, NULL);
+	if (IS_ERR(mbox_clk)) {
+		dev_err(&pdev->dev, "failed to get msgbox clock: %ld\n",
+			PTR_ERR(mbox_clk));
+		return PTR_ERR(mbox_clk);
+	}
+	dev_info(&pdev->dev, "msgbox clock enabled, rate=%lu Hz\n",
+		 clk_get_rate(mbox_clk));
+
+	/* Shared — mipsloader may already hold RST_BUS_MSGBOX (same CCU line).
+	 * Optional so missing reset node isn't fatal. */
+	mbox_rst = devm_reset_control_get_optional_shared(&pdev->dev, NULL);
+	if (IS_ERR(mbox_rst)) {
+		dev_err(&pdev->dev, "failed to get msgbox reset: %ld\n",
+			PTR_ERR(mbox_rst));
+		return PTR_ERR(mbox_rst);
+	}
+	if (mbox_rst) {
+		ret = reset_control_deassert(mbox_rst);
+		if (ret) {
+			dev_err(&pdev->dev, "msgbox reset deassert failed: %d\n", ret);
+			return ret;
+		}
+		dev_info(&pdev->dev, "msgbox reset deasserted (shared)\n");
+	} else {
+		dev_info(&pdev->dev, "no msgbox reset in DTS (ok)\n");
+	}
 
 	/* Get shared memory region from DTS */
 	mem_node = of_parse_phandle(np, "shared-memory", 0);

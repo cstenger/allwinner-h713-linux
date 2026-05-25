@@ -26,63 +26,71 @@
 
 /*
  * ══════════════════════════════════════════════════════════════
- * Custom counting semaphore compatible with stock 4-byte layout
- *
- * The stock kernel uses 4-byte semaphore counters at packed offsets.
- * Mainline struct semaphore is 16 bytes (spinlock+count+wait_list)
- * and would overlap adjacent fields. These helpers operate on a raw
- * u32 counter + a global waitqueue, matching the stock layout.
- *
- * BUG-19 fix: replaces all (struct semaphore *) casts throughout.
+ * 2026-05-04 Y2: Switched to Linux struct semaphore primitives
+ * to match stock kernel exactly. Stock decompile shows
+ *   v20 = down_interruptible(v19);    // v19 = sock+8 / sock+1036
+ *   v45 = down_timeout(v19 + 16, 500); // sock+24 / sock+1052
+ *   up(v19);
+ * Stock layout has 16-byte struct semaphore at those offsets:
+ *   sock+8..23   sema_init(_, 1)  local-send sem
+ *   sock+24..39  sema_init(_, 0)  local-ack sem
+ *   sock+1036..1051 sema_init(_, 1) remote-send sem
+ *   sock+1052..1067 sema_init(_, 0) remote-ack sem
+ * Custom 4-byte counter + shared waitqueue (previous impl) had
+ * wait-list semantics that mismatched stock and caused process_timer
+ * task-pointer corruption (Y2 crash: try_to_wake_up @ MIPS-VA 0x8baa0000).
+ * InitCommSeqMem must call sema_init() at these offsets — see mem.c.
  * ══════════════════════════════════════════════════════════════
  */
 
-extern wait_queue_head_t cpu_comm_sem_wq;
-
 static inline void cpu_comm_sem_down(void *addr)
 {
-	u32 *count = (u32 *)addr;
-
-	wait_event_interruptible(cpu_comm_sem_wq, *count > 0);
-	(*count)--;
+	down((struct semaphore *)addr);
 }
 
 static inline int cpu_comm_sem_down_interruptible(void *addr)
 {
-	u32 *count = (u32 *)addr;
-	int ret;
-
-	ret = wait_event_interruptible(cpu_comm_sem_wq, *count > 0);
-	if (ret)
-		return ret;
-	(*count)--;
-	return 0;
+	return down_interruptible((struct semaphore *)addr);
 }
 
 static inline int cpu_comm_sem_down_timeout(void *addr, long jiffies)
 {
-	u32 *count = (u32 *)addr;
-	long ret;
-
-	ret = wait_event_interruptible_timeout(cpu_comm_sem_wq,
-					       *count > 0, jiffies);
-	if (ret == 0)
-		return -ETIME;	/* timeout */
-	if (ret < 0)
-		return (int)ret; /* interrupted */
-	(*count)--;
-	return 0;
+	return down_timeout((struct semaphore *)addr, jiffies);
 }
 
 static inline void cpu_comm_sem_up(void *addr)
 {
-	u32 *count = (u32 *)addr;
-
-	if (!count)
+	if (!addr)
 		return;
+	up((struct semaphore *)addr);
+}
 
-	(*count)++;
-	wake_up_all(&cpu_comm_sem_wq);
+/* ══════════════════════════════════════════════════════════════
+ * 2026-05-05 Y2-followup: defensive MIPS-VA range-check.
+ *
+ * MIPS firmware sometimes writes MIPS-internal KSEG0 pointers
+ * (0x80000000-0x9FFFFFFF — MIPS firmware code/dram region) into
+ * shared-memory fields that ARM later dereferences (wait_ptr in
+ * entry+32, FIFO entry pointers, list-node links). Those addresses
+ * are not mapped on ARM → dereferencing corrupts kernel state.
+ * Y2 oops cascade pattern: *pte=8b15b... or 8baa... in unrelated
+ * processes.
+ *
+ * Range narrowed to KSEG0 only:
+ *   - 0x80000000-0x9FFFFFFF (MIPS-internal code/data) — REJECT
+ *   - 0xA0000000-0xBFFFFFFF (KSEG1) — ACCEPT, includes valid
+ *     ARM-virt vmap of shared memory (e.g. 0xbf0a48xx) that
+ *     would be wrongly flagged with the broader 0xC0... mask.
+ *
+ * This is symptomatic — the real fix is full Mid<->Vir translation
+ * (stock cpu_comm_dev.ko has Vir2Mid/Mid2Vir/Mid2Phy/Phy2Mid). Until
+ * that's implemented, this guard prevents the crash cascade so we
+ * can keep the box up while diagnosing which routines leak.
+ * ══════════════════════════════════════════════════════════════ */
+
+static inline bool cpu_comm_is_mips_va(u32 ptr)
+{
+	return (ptr & 0xE0000000) == 0x80000000;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -107,7 +115,7 @@ static inline void cpu_comm_sem_up(void *addr)
 #define MSGBOX_BASE		0x03003000
 
 /* Hardware spinlock IDs */
-#define HW_SPINLOCK_COUNT	14
+#define HW_SPINLOCK_COUNT	9
 #define HW_SPINLOCK_APP_START	5	/* app-usable locks start at 5 */
 #define HW_SPINLOCK_APP_END	11
 
@@ -160,8 +168,14 @@ static inline void cpu_comm_sem_up(void *addr)
 #define MSG_FLAG_RETURN_ACK	BIT(1)	/* expects return acknowledgement */
 #define MSG_FLAG_SENT		BIT(2)	/* message has been dispatched */
 
-/* SendCommLow interrupt type */
-#define INTR_TYPE_SEND		2
+/* HY310 NOTE 2026-04-20: INTR_TYPE_SEND was a hard-coded 2 used as the
+ * low-16 (comm_type) for ALL outgoing msgbox writes. Per RE of MIPS
+ * cpu_comm_msg_cb (sub_8B12254C, trid_cpucomm_hal.c:18-51) the low-16
+ * is parsed as the dispatch case (0=CALL, 1=RETURN, 2=CALL_ACK,
+ * 3=RETURN_ACK = MSG_TYPE_*). Using a constant 2 routed every fresh
+ * CALL to MIPS's CallACK handler, which then dropped the message.
+ * Callers now pass MSG_TYPE_* directly via sunxi_cpu_comm_send_intr_to_mips.
+ * The constant is gone — do not re-introduce. */
 
 /* pcpu_comm_dev allocation */
 #define CPU_COMM_DEV_SIZE	119648	/* 0x1D360 bytes */
@@ -486,6 +500,7 @@ extern int cpu_comm_suspend_flag;
 /* cpu_comm_hw.c — hardware abstraction */
 int  cpu_comm_hw_init(void);
 void cpu_comm_hw_cleanup(void);
+int  cpu_comm_send_to_arisc(u8 type, u8 length, const u8 *pdata);
 int  comm_ReadRegWord(u32 reg_addr);
 void comm_WriteRegWord(u32 reg_addr, u32 value);
 int  comm_ReadShareReg(int reg_id);
@@ -594,6 +609,7 @@ void RoutineCleanupInCPUReset(void *data);
 void Comm_Add2Call2WQ(void *data);
 void comm_CallWorkAction(void *data);
 void comm_WorkAction(struct work_struct *work);
+void cpu_comm_init_action_work(void);
 
 /* cpu_comm_dev.c — kernel interface */
 int  cpu_comm_init(int mode);
@@ -635,8 +651,28 @@ void sunxi_cpu_comm_send_intr_to_mips(u32 cpu, u32 type, u32 value);
 
 /* H713 direct msgbox IRQ handler (replaces mailbox framework) */
 int  cpu_comm_msgbox_request_irq(int irq, void *callback);
+int  cpu_comm_msgbox_start_polling(void *callback);
 void cpu_comm_msgbox_free_irq(void);
 void cpu_comm_msgbox_probe_start(void);	/* legacy stub */
 void cpu_comm_msgbox_probe_stop(void);	/* legacy stub */
+
+
+/* ══════════════════════════════════════════════════════════════
+ * 2026-05-06 CC-night: userspace receive-channel
+ *
+ * Allows userspace to read incoming MIPS→ARM CALL messages via
+ * read()/poll() on /dev/cpu_comm. See cpu_comm_user.c.
+ * ══════════════════════════════════════════════════════════════ */
+struct file;
+struct inode;
+struct poll_table_struct;
+
+int     cpu_comm_user_open(struct inode *inode, struct file *file);
+void    cpu_comm_user_release(struct file *file);
+ssize_t cpu_comm_user_read(struct file *file, char __user *buf,
+                           size_t count, loff_t *ppos);
+unsigned int cpu_comm_user_poll(struct file *file,
+                                struct poll_table_struct *wait);
+void    cpu_comm_userspace_deliver(const void *msg);
 
 #endif /* _CPU_COMM_H_ */

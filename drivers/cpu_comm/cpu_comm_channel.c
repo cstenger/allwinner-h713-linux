@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/semaphore.h>
+#include <linux/printk.h>
 #include "cpu_comm.h"
 
 /* ── Channel Pool ──────────────────────────────────────────── */
@@ -88,8 +89,17 @@ int Comm_AddNewChannel(void *pool_ptr, u16 comp_id, u32 cpu)
 		u32 *slot = &pool[9 + i * CHANNEL_SLOT_DWORDS];
 		if (slot[0] == 0) {
 			slot[0] = channel_id;
-			slot[1] = 0; /* session count */
-			pool[0]++;   /* increment active count */
+			slot[1] = 0;   /* session count */
+			slot[2] = cpu; /* cpu/thread-id — validated by Add2NewCallFifo */
+			slot[3] = channel_id; /* id — validated by Add2NewCallFifo */
+			/* Y2 2026-05-04: slot+16 (= slot[4..7]) is a 16-byte
+			 * struct semaphore. Comm_Add2NewCallFifo calls up() on
+			 * it; without sema_init the raw_spinlock is uninitialized
+			 * → up() spins forever → RCU stall.
+			 * Initial count=0 (waiter blocks until first up) — owner
+			 * is the dispatch thread that will down() it. */
+			sema_init((struct semaphore *)&slot[4], 0);
+			pool[0]++;     /* increment active count */
 			pr_debug("cpu_comm: channel added: comp=%u cpu=%u id=0x%x\n",
 				 comp_id, cpu, channel_id);
 			return 0;
@@ -168,6 +178,9 @@ void Comm_Add2NewCallFifo(void *pool_ptr, u32 *cmd_fifo, u32 call_entry)
 	if (!channel_ptr) {
 		pr_warn("cpu_comm: Comm_Add2NewCallFifo: no channel for id 0x%x\n",
 			channel_id);
+		/* DBG-CALL-ENTRY-DUMP — temporary 2026-05-06 */
+		print_hex_dump(KERN_WARNING, "  call_entry: ", DUMP_PREFIX_OFFSET,
+			       16, 4, (const u8 *)call_entry, 64, false);
 		return;
 	}
 
@@ -446,7 +459,11 @@ void ReleaseWaitComm(u32 cpu_id, u32 wait_entry)
 	if (WARN_ON(cpu_id > 1))
 		return;
 
-	/* FreeWait FIFO at sock[34], sem at sock[30] */
+	/* FreeWait FIFO at sock[34], struct semaphore at sock[30] (sock+120).
+	 * 2026-05-05 Y2: was sock[31] which was the COUNT field, not the
+	 * sem base. With Linux down/up primitives, the address must point
+	 * to struct semaphore base (lock at offset 0). InitCommSeqMem now
+	 * does sema_init((struct semaphore *)&sock[30], 1). */
 	fifo = &s_CommSockt[1248 * cpu_id + 34];
 	sem  = &s_CommSockt[1248 * cpu_id + 30];
 
@@ -597,7 +614,11 @@ void Comm_ReleaseFreeCall(void *share_seq, void *call)
 	}
 
 	fifo = (u32 *)(seq + 120);
-	sem = &s_CommSockt[1248 * remote_cpu + 234]; /* byte 936 from sock */
+	/* 2026-05-05 Y2: struct semaphore base at sock[234] (sock+936) —
+	 * was sock[235] (count field). InitCommSeqMem now does
+	 * sema_init((struct semaphore *)&sock[234], 1). Linux down/up
+	 * needs sem base addr, not the count u32. */
+	sem = &s_CommSockt[1248 * remote_cpu + 234];
 
 	cpu_comm_sem_down((void *)sem);
 
@@ -612,6 +633,30 @@ void Comm_ReleaseFreeCall(void *share_seq, void *call)
 	if (!wr_slot_vir) {
 		pr_err("cpu_comm: Comm_ReleaseFreeCall: null wr_slot_vir!\n");
 		return;
+	}
+
+	/* HY310-instrumentation 2026-04-22: range-check pointers before the
+	 * write that's suspected of corrupting kernel memory outside shmem.
+	 * Both the write target (wr_slot_vir) and the source pointer (call)
+	 * must live inside the 5MB mapped shmem region.
+	 */
+	{
+		u32 shmem_end = ShMemAddrBase + ShMemSize;
+
+		if ((u32)wr_slot_vir < ShMemAddrBase ||
+		    (u32)wr_slot_vir >= shmem_end) {
+			pr_err("cpu_comm: Comm_ReleaseFreeCall: wr_slot_vir=%p OUT OF RANGE [%x..%x), wr_slot_phy=%x\n",
+			       wr_slot_vir, ShMemAddrBase, shmem_end,
+			       wr_slot_phy);
+			cpu_comm_sem_up((void *)sem);
+			return;
+		}
+		if ((u32)call < ShMemAddrBase || (u32)call >= shmem_end) {
+			pr_err("cpu_comm: Comm_ReleaseFreeCall: call=%p OUT OF RANGE [%x..%x)\n",
+			       call, ShMemAddrBase, shmem_end);
+			cpu_comm_sem_up((void *)sem);
+			return;
+		}
 	}
 
 	/* Clear flags on the call entry before returning to pool */
@@ -657,6 +702,13 @@ int AddReturn2Fifo(u32 *fifo, void *data)
 
 	if (WARN_ON(!fifo || !data))
 		return 0;
+
+	/* Y2-followup: refuse MIPS-internal pointer as data */
+	if (cpu_comm_is_mips_va((u32)data)) {
+		pr_warn_ratelimited("cpu_comm: AddReturn2Fifo: skip MIPS-VA data=%p\n",
+				    data);
+		return 0;
+	}
 
 	wr_slot = (u32 *)fifo_getItemWr(fifo);
 	if (!wr_slot) {
@@ -727,7 +779,20 @@ int GetReturnbySessionId(u32 session_id, u32 cpu, u32 *result)
 
 	cur_node = fifo_hdr[14];	/* head.next */
 
+	pr_info_ratelimited("cpu_comm: GetReturnbySessionId session=0x%x cpu=%u: list head.next=0x%x sentinel=0x%x count=%d\n",
+		session_id, cpu, cur_node, sentinel, fifo_hdr[13]);
+
 	while (cur_node != sentinel) {
+		/* Y2-followup: bail if list got corrupted with MIPS-VA */
+		if (cpu_comm_is_mips_va(cur_node)) {
+			pr_err("cpu_comm: GetReturnbySessionId: corrupt list MIPS-VA=0x%08x session=0x%x\n",
+			       cur_node, session_id);
+			if (result)
+				*result = 0;
+			cpu_comm_sem_up((void *)sem);
+			return 0;
+		}
+
 		next_node = *(u32 *)cur_node;
 
 		/*
@@ -764,7 +829,13 @@ int GetReturnbySessionId(u32 session_id, u32 cpu, u32 *result)
 		cur_node = next_node;
 	}
 
-	/* Not found */
+	/* Not found — match stock semantic (IDA @ 0x59cc): return 0 with
+	 * *result=NULL. CallEx checks return_entry against NULL and skips
+	 * Comm_ReleaseFreeCall but still calls GetWaitbySessionId +
+	 * ReleaseWaitComm (with the WAIT entry, not the return entry). The
+	 * earlier -ENOENT quick-fix (W-session 2026-05-03) was a workaround
+	 * for the wrong release-target bug in CallEx; with that bug fixed,
+	 * stock semantic is restored here. */
 	if (result)
 		*result = 0;
 
@@ -812,13 +883,26 @@ void returnPipeLine(void *data)
 	sock = &s_CommSockt[1248 * cpu];
 	sem = &sock[283];			/* MsgFIFO semaphore */
 
+	pr_info_ratelimited("cpu_comm: returnPipeLine cpu=%u: share_seq_r=0x%x fifo[rd=%u wr=%u peak=%u sem=%u cap=%u itemsz=%u base=0x%x]\n",
+		cpu, share_seq_r, fifo[0], fifo[1], fifo[2], fifo[3], fifo[4], fifo[5], fifo[6]);
+
 	cpu_comm_sem_down((void *)sem);
 
 	item_addr = fifo_getItemRd(fifo);
+	pr_info_ratelimited("cpu_comm: returnPipeLine first_item_addr=0x%x\n", item_addr);
 
 	while (item_addr) {
 		/* Read the entry pointer from the FIFO slot */
 		entry_vir = *(u32 *)item_addr;
+
+		/* Y2-followup: skip MIPS-internal pointers — would corrupt
+		 * kernel page tables on dereference. */
+		if (cpu_comm_is_mips_va(entry_vir)) {
+			pr_warn_ratelimited("cpu_comm: returnPipeLine: skip MIPS-VA entry=0x%08x\n",
+					    entry_vir);
+			item_addr = fifo_ItemRdNext(fifo);
+			continue;
+		}
 
 		/* Validate slot index */
 		if (*(u16 *)(entry_vir + 4) > 19) {

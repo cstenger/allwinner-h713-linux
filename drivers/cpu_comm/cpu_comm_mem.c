@@ -489,6 +489,14 @@ void checkNoticeReqedJob(void)
  * Conversion: Vir = Phy + (ShMemAddrVir - ShMemAddr)
  *             Phy = Vir - (ShMemAddrVir - ShMemAddr)
  *             MID = Phy (on H713)
+ *
+ * NOTE 2026-05-04: Session-Y patches (KSEG2 dynamic / KSEG1 hardcoded
+ * delta) were tested and reverted — neither changed RETURN behaviour.
+ * Translation arithmetic is not the blocker. Counter-cave evidence:
+ * MIPS sends 19/19 ACKs but 0/19 RETURNs regardless of what mid form
+ * we hand it. The blocker is between command_action ACK and
+ * SendComm2CPUEx(RETURN) inside the MIPS firmware (or in MIPS-side
+ * comm_request bookkeeping that we haven't located yet).
  */
 
 u32 Mid2Phy(u32 cpu, u32 mid)
@@ -650,34 +658,22 @@ void InitCommSeqMem(u32 cpu_id)
 
 	/* ── Basic socket fields ── */
 	sock[0] = cpu_id;
-	/*
-	 * sem at offset 8 (sock[2]): local send semaphore.
-	 * MIPS binary uses seq_base+8 for local sem_ptr.
-	 * Must be 1 to allow first sem_down to succeed.
-	 */
-	sock[2] = 1;		/* local send sem count = 1 */
-	sock[3] = 1;		/* sem_count */
 
-	/* Self-referencing linked list 0 at sock[4] */
-	sock[4] = (u32)&sock[4];
-	sock[5] = (u32)&sock[4];
-	sock[6] = 0;
-	sock[7] = 0;
-
-	/* Self-referencing linked list 1 at sock[8] */
-	sock[8] = (u32)&sock[8];
-	sock[9] = (u32)&sock[8];
+	/* 2026-05-04 Y2: struct semaphore at sock+8 (local-send, count=1)
+	 * and sock+24 (local-ack, count=0). Stock SendComm2CPUEx uses
+	 * down_interruptible(sock+8) and down_timeout(sock+24, 500).
+	 * sema_init writes lock=0/count=N/wait_list=self at the 16-byte
+	 * struct, replacing the previous manual u32 init that wrongly set
+	 * the lock field to 1 (= held). */
+	sema_init((struct semaphore *)&sock[2], 1);   /* sock+8  count=1 */
+	sema_init((struct semaphore *)&sock[6], 0);   /* sock+24 count=0 */
 
 	/* ── SendCmdWaitList MsgFIFO at &sock[10] (= byte offset 40) ── */
 	InitMsgFIFO(&sock[10], interSeq2Name(sock), " SendCmdWaitList", 1);
 
-	/* ── Fields around the send FIFO ── */
-	sock[30] = 0;
-	sock[31] = 1;		/* sem = 1 */
-
-	/* Self-referencing list at sock[32] */
-	sock[32] = (u32)&sock[32];
-	sock[33] = (u32)&sock[32];
+	/* ── Fields around the send FIFO ──
+	 * Y2: struct semaphore at sock+120 (sock[30]) count=1. */
+	sema_init((struct semaphore *)&sock[30], 1);  /* sock+120 count=1 */
 
 	/* ── FreeWait FIFO at sock[34] ──
 	 *
@@ -763,13 +759,9 @@ void InitCommSeqMem(u32 cpu_id)
 	/* Clear sem — FIFO pre-fill complete */
 	sock[37] = 0;
 
-	/* ── Additional list/semaphore fields ── */
-	sock[234] = 0;
-	sock[235] = 1;		/* sem = 1 */
-
-	/* Self-referencing list at sock[236] (= byte offset 944) */
-	sock[236] = (u32)&sock[236];
-	sock[237] = (u32)&sock[236];
+	/* ── Additional list/semaphore fields ──
+	 * Y2: struct semaphore at sock+936 (sock[234]) count=1. */
+	sema_init((struct semaphore *)&sock[234], 1); /* sock+936 count=1 */
 
 	/* ── CallCmd ring buffer at sock[238] (= byte offset 952) ──
 	 * Capacity = 21 slots × 4 bytes; mmioset to 0.
@@ -787,29 +779,20 @@ void InitCommSeqMem(u32 cpu_id)
 	pr_info("cpu_comm: InitCommSeqMem(%u): sock[248]=0x%x (remote sem @ offset 0x3E0)\n",
 		cpu_id, sock[248]);
 
-	sock[259] = 0;
-	sock[260] = 1;		/* sem = 1 */
-
-	/* Self-referencing pair at sock[261] */
-	sock[261] = (u32)&sock[261];
-	sock[262] = (u32)&sock[261];
-
-	sock[263] = 0;
-	sock[264] = 0;
-
-	/* Self-referencing pair at sock[265] */
-	sock[265] = (u32)&sock[265];
-	sock[266] = (u32)&sock[265];
+	/* Y2: struct semaphore at sock+1036 (remote-send, count=1) and
+	 * sock+1052 (remote-ack, count=0). Stock SendComm2CPUEx uses
+	 * down_interruptible(sock+1036) for remote and down_timeout
+	 * (sock+1052, 500) for remote-ack. */
+	sema_init((struct semaphore *)&sock[259], 1); /* sock+1036 count=1 */
+	sema_init((struct semaphore *)&sock[263], 0); /* sock+1052 count=0 */
+	pr_info("cpu_comm: InitCommSeqMem(%u): sema_init at +1036 (count=1) and +1052 (count=0)\n",
+		cpu_id);
 
 	/* ── ReturnList MsgFIFO at &sock[267] ── */
 	InitMsgFIFO(&sock[267], interSeq2Name(sock), " ReturnList", 1);
 
-	sock[287] = 0;
-	sock[288] = 1;		/* sem = 1 */
-
-	/* Self-referencing pair at sock[289] */
-	sock[289] = (u32)&sock[289];
-	sock[290] = (u32)&sock[289];
+	/* Y2: struct semaphore at sock+1148 (sock[287]) count=1. */
+	sema_init((struct semaphore *)&sock[287], 1); /* sock+1148 count=1 */
 
 	/* ── Share sequence R CallCmd/ReturnCmd FIFO setup ──
 	 *
@@ -870,6 +853,60 @@ void InitCommSeqMem(u32 cpu_id)
 			strncpy((char *)share_seq_r1 + 64, "ReturnCmd", 32);
 			*(u32 *)((u8 *)share_seq_r1 + 96) = 0;
 		}
+	}
+
+	/*
+	 * WORKAROUND: MIPS never initializes its share_seq structures
+	 * (cap stays 0xFFFFFFFF → fifo_isNearlyFull is always true).
+	 * Stock Android boots with this working; on our mainline we
+	 * have to init the cpu=1 (MIPS-side) entries ourselves.
+	 *
+	 * getShareSeq(cpu=1, remote=0, dir) is where ARM writes for ARM→MIPS.
+	 * When cpu_id==1 in this loop, init cpu=1 entries too.
+	 */
+	if (cpu_id == 1) {
+		int d, r;
+		/* Init ALL 4 MIPS-side structs (cpu=1, any remote, any dir) */
+		for (r = 0; r < 2; r++) for (d = 0; d < 2; d++) {
+			u32 addr = ShMemAddrBase + 9760*1 + 4880*r + 2440*d + 152;
+			u32 *seq = (u32 *)(uintptr_t)addr;
+			u32 *fifo = (u32 *)((u8 *)seq + 32);
+			u32 items_phy;
+			u32 items_kseg1;
+			/* Clear first 64 bytes (header) */
+			memset_io((void __iomem *)seq, 0, 64);
+			fifo[0] = 0;
+			fifo[1] = 0;
+			fifo[2] = 0;
+			fifo[3] = 1;
+			fifo[4] = 21;
+			fifo[5] = 4;
+
+			/*
+			 * HY310 2026-04-22 items_base fix: previously fifo[6]=0
+			 * which caused fifo_getItemWr to return 0 ("items_base +
+			 * wr*item_size = 0"), interpreted as FIFO full by
+			 * Comm_Add2NewCallFifo -> while(1) panic on first dispatch.
+			 *
+			 * Use the apparent unused gap at seq+276..+359 (84 bytes,
+			 * between the +120-FIFO items buffer at +192..+275 and
+			 * call-entries at +360) as storage for this FIFO's items.
+			 * Write items_base as MIPS KSEG1 view so MIPS can follow it.
+			 */
+			items_phy = (((u32)(uintptr_t)seq) + 276 - ShMemAddrBase)
+				    + ShMemAddr;
+			items_kseg1 = 0xA0000000u | (items_phy & 0x1FFFFFFFu);
+			fifo[6] = items_kseg1;
+			memset_io((void __iomem *)((u8 *)seq + 276), 0, 84);
+
+			fifo[7] = 0;
+			memset_io((void __iomem *)((u8 *)seq + 64), 0, 40);
+			strncpy((char *)seq + 64,
+				d == 0 ? "CallCmd" : "ReturnCmd", 32);
+			*(u32 *)((u8 *)seq + 96) = 0;
+		}
+		pr_info("cpu_comm: MIPS-side share_seq forced, addr=0x%x (items_base set)\n",
+			ShMemAddrBase + 9760 + 2440 + 152);
 	}
 
 	pr_debug("cpu_comm: InitCommSeqMem(%u) done\n", cpu_id);
@@ -1684,12 +1721,25 @@ int Trid_SMM_Init(u32 base, u32 size)
 		 * NOT 19712! Previous code was off by 16 bytes.
 		 */
 		/*
-		 * IDA: v17[2462] = heap_phy → offset 2462*8 = 19696 (as _QWORD*)
-		 *      *((_DWORD*)v17 + 4926) = size → offset 4926*4 = 19704
-		 * Base is at 19696 (8 bytes: u64), Size at 19704 (4 bytes: u32)
+		 * HY310 2026-04-21: offsets corrected from evidence-based IDA
+		 * analysis of MIPS smmMalloc @ 0x8B123040 and 0x8B123170.
+		 *
+		 * MIPS firmware reads the heap descriptor table with:
+		 *   v1 = ShMemBase + heap_index * 8          (stride = 8, not 72)
+		 *   dword0 = *(v1 + 0x4D00)                   (base 19712, not 19696)
+		 *   dword1 = *(v1 + 0x4D04)
+		 *   if (dword0 | dword1 == 0) → ERROR "heap[N] is not initialized!"
+		 *
+		 * In the success path MIPS does:
+		 *   a0 = 0xA0000000 | (dword0 & 0x1FFFFFFF)   (KSEG1 view of phys)
+		 *   jal __shmalloc(a0 = heap_ptr, a1 = size)
+		 * so dword0 must be the physical address of the heap header.
+		 * dword1 is loaded but not consumed in the immediate recursive
+		 * call; we set it to `size` to match the apparent intent and
+		 * to be safe against MIPS code paths we haven't traced.
 		 */
-		*(u64 *)(((u8 *)shmem) + 19696 + 72 * slot) = (u64)heap_phy;
-		*(u32 *)(((u8 *)shmem) + 19704 + 72 * slot) = size;
+		*(u32 *)(((u8 *)shmem) + 0x4D00 + 8 * slot) = heap_phy;
+		*(u32 *)(((u8 *)shmem) + 0x4D04 + 8 * slot) = size;
 	}
 
 	comm_SpinUnLock(1, 0);
@@ -2179,8 +2229,17 @@ int InitCommMem(int mode)
 					ShMemAddr, ShMemSize1);
 		}
 
-		/* Set spinlock type and mark ARM as ready + app-ready */
-		comm_SpinLocksetType(2, 1);
+		/* Mark ARM as ready + app-ready.
+		 * HY310 2026-04-22: REMOVED comm_SpinLocksetType(2, 1) here.
+		 * That call wrote byte[0] of lock 2 = 1, which our RE'd ARM driver
+		 * treats as "type=mutex" but the MIPS firmware's enterCritical
+		 * (sub_8B124FBC) checks byte[0] as "free=2" marker and spins forever
+		 * if != 2. Observed: MIPS hung in spinLock(2,quick) after boot,
+		 * routine registration never started. Removing this call keeps
+		 * lock 2 in the 0x02000202 state comm_InitSpinLock produced, which
+		 * MIPS sees as FREE and can acquire. The "type" concept in our
+		 * driver is likely a mis-interpretation of the stock SharedMem
+		 * layout — MIPS uses byte[0] as the enterCritical-level owner. */
 		setCPUReady(CPU_ID_ARM);
 
 		/*
@@ -2195,9 +2254,33 @@ int InitCommMem(int mode)
 		{
 			u32 *arm_flag = (u32 *)(ShMemAddrBase +
 						CPU_FLAG_OFFSET(CPU_ID_ARM));
-			*arm_flag |= CPU_FLAG_APP_READY;
-			pr_info("cpu_comm: ARM flag pre-set to 0x%x before spinlock release\n",
-				*arm_flag);
+			u32 *mips_flag = (u32 *)(ShMemAddrBase +
+						CPU_FLAG_OFFSET(CPU_ID_MIPS));
+			/* Write CLEAN values — both ARM_flag AND MIPS_flag slots may
+			 * contain uninit 0xffffffff garbage (NOTICE_REQ bit 3 set),
+			 * which makes MIPS-FW loop forever in Wait CPUNoticeReqed.
+			 * Initialize BOTH slots to a sane state so MIPS sees no
+			 * spurious NOTICE_REQ on its own flag. */
+			*arm_flag = CPU_FLAG_READY | CPU_FLAG_APP_READY;  /* 0x5 */
+			/*
+			 * HY310 2026-04-22 (revised): MIPS_flag MUST be 0x0, NOT 0x5.
+			 *
+			 * Earlier we force-set mips_flag=0x5 to avoid a stale reset-bit
+			 * from uninitialized DRAM (0xfffffff7). Problem: MIPS's
+			 * InitCommMem reads its own isCPUReady(MIPS) right after
+			 * exiting the "wait for ARM ready" loop. If the flag already
+			 * reads 0x5, MIPS concludes "I'm already initialized" and
+			 * SKIPS InitCommSeqMem(0)+(1) — leaving the per-cpu sems at
+			 * 0x8B253120 / 0x8B2535B0 uninitialized. BG_Thread then hangs
+			 * on the first call inside Comm_ReleaseFreeCall's sem_get.
+			 *
+			 * Write 0x0 (clean, not-ready, no reset-bit) so MIPS sees
+			 * "self not ready", runs its InitCommSeqMem properly, then
+			 * sets the flag itself.
+			 */
+			*mips_flag = 0;
+			pr_info("cpu_comm: flags init CLEAN: ARM=0x%x MIPS=0x%x (MIPS must self-set after init)\n",
+				*arm_flag, *mips_flag);
 		}
 
 		spinUnlockhwReg(0);
@@ -2240,9 +2323,27 @@ int InitCommMem(int mode)
 			}
 		}
 
-		/* Wait for all CPUs to clear their notice requests */
-	while (isCPUNoticeReqed(0) || isCPUNoticeReqed(1))
-		msleep(10);
+		/* Wait for all CPUs to clear their notice requests.
+		 * With timeout: cached reads may permanently return 0xffffffff
+		 * (all bits set incl NOTICE_REQ) causing infinite loop. */
+	{
+		unsigned int wait_ms = 0;
+		const unsigned int wait_timeout_ms = 2000;
+
+		while (isCPUNoticeReqed(0) || isCPUNoticeReqed(1)) {
+			if (wait_ms >= wait_timeout_ms) {
+				pr_warn("cpu_comm: NOTICE_REQ clear TIMEOUT %ums (ARM=0x%x MIPS=0x%x) — proceeding\n",
+					wait_ms,
+					*(u32 *)(ShMemAddrBase + CPU_FLAG_OFFSET(CPU_ID_ARM)),
+					*(u32 *)(ShMemAddrBase + CPU_FLAG_OFFSET(CPU_ID_MIPS)));
+				break;
+			}
+			msleep(10);
+			wait_ms += 10;
+			if ((wait_ms % 500) == 0)
+				pr_info("cpu_comm: waiting NOTICE_REQ clear... (%ums)\n", wait_ms);
+		}
+	}
 
 	pr_info("cpu_comm: shared memory initialized (base=0x%x size=0x%x)\n",
 		ShMemAddr, ShMemSize);

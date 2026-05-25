@@ -48,11 +48,15 @@ void InitMsgFIFO(void *fifo_ptr, const char *prefix, const char *suffix,
 	f[15] = (u32)&f[14];		/* tail = &head */
 
 	if (mode >= 0) {
-		f[16] = 1;		/* sem count = 1 (protects list ops) */
-		f[17] = mode;		/* owner */
-		/* Secondary wait list */
-		f[18] = (u32)&f[18];	/* wait_head = &wait_head */
-		f[19] = (u32)&f[18];	/* wait_tail = &wait_head */
+		/* Y2 2026-05-04: f[16..19] is a 16-byte struct semaphore.
+		 * Stock takes the address of f[16] and calls
+		 * down_interruptible/up on it directly. Layout:
+		 *   f[16] lock=0, f[17] count=1 (owner=1), f[18/19] wait_list.
+		 * Previous manual u32 init set f[16]=1 (= lock held), which
+		 * caused infinite-spin in down() once we switched to Linux
+		 * primitives. */
+		sema_init((struct semaphore *)&f[16], 1);
+		f[17] = mode;		/* owner — sema_init wrote 1 here, mode may differ */
 	}
 }
 
