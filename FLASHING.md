@@ -72,16 +72,54 @@ two things:
 | `bootdelay` | `5` | **The 5-second UART-interrupt window** — without this, no prompt. |
 | `bootcmd` | `usb start; run setargs_nand boot_normal` | Initialise USB PHY before boot, so `usb start` at the prompt actually finds devices. |
 
-```bash
-# See: https://github.com/well0nez/sunxi-env-patcher
-python3 sunxi-env-patcher/patch_env.py
+[`sunxi-env-patcher`](https://github.com/well0nez/sunxi-env-patcher) is a pure
+Python tool that **runs on a host PC** (not the device). It takes either a raw
+`env_a` partition dump or an `env.fex` extracted from a stock firmware image,
+applies the patch with a correct CRC32 (which covers only the first 128 KiB of
+the partition — most manual tools get this wrong), and outputs a patched binary
+ready to flash back.
+
+There are two ways to get the patched env back onto a fresh device. Both are
+documented in [`magcubic-root`](https://github.com/well0nez/magcubic-root), the
+sister toolkit which handles Allwinner `IMAGEWTY` firmware images via `awimg.py`.
+
+**Path 1 — Firmware-image patch (recommended, safe):**
+
+1. Extract the stock firmware image with `awimg.py` → gives you `env.fex`.
+2. `python3 sunxi_env_patcher.py patch env.fex -o env_patched.fex --set bootdelay=5` (and the bootcmd edit).
+3. Repack the firmware with `awimg.py` — it automatically recomputes partition
+   checksums (without this, PhoenixUSBPro fails at the bad partition with
+   error `0x164`).
+4. Flash the repacked image via USB stick, the device's "Local UI update", or
+   PhoenixUSBPro (FEL-mode recovery).
+
+**Path 2 — Direct eMMC raw write via ADB (no root needed, faster, but bootloop risk):**
+
+On stock firmware, `/dev/block/mmcblk0` is `rw-rw-rw-` for the unprivileged
+`shell` user — a firmware permissions flaw that lets you `dd` raw blocks
+without root or a bootloader unlock. Procedure (verbatim from magcubic-root):
+
+```sh
+# find the env_a partition (look up its block offsets from sysfs):
+adb shell 'cat /proc/partitions | grep mmcblk0'
+adb shell 'cat /sys/block/mmcblk0/mmcblk0p3/start /sys/block/mmcblk0/mmcblk0p3/size'
+
+# dump env_a from raw eMMC (skip+count in 512 B sectors from sysfs above):
+adb shell 'dd if=/dev/block/mmcblk0 of=/data/local/tmp/env_a.bin bs=512 skip=$START count=$SIZE'
+adb pull /data/local/tmp/env_a.bin
+
+# patch on host:
+python3 sunxi_env_patcher.py patch env_a.bin -o env_a_patched.bin --set bootdelay=5
+
+# write back (note: seek, conv=notrunc — DO NOT just `dd of=mmcblk0p3`):
+adb push env_a_patched.bin /data/local/tmp/
+adb shell 'dd if=/data/local/tmp/env_a_patched.bin of=/dev/block/mmcblk0 bs=512 seek=$START conv=notrunc'
+adb shell 'sync'
 ```
 
-The patcher itself is run *on* the HY310 (it writes `/dev/mmcblk0p3` directly).
-On a brand-new device that means: dump `env_a` from stock Android (root shell
-or recovery) → patch on a host with the same tool → write back to `mmcblk0p3`
-from the same Android shell. After that one reboot you have `bootdelay=5` and
-everything below works. **Do this before attempting Method 1 or any recovery.**
+magcubic-root itself notes Path 2 as **"Not recommended"** because of bootloop
+risk if anything is off — Path 1 is the safer default. **Do this before attempting
+Method 1 or any recovery.**
 
 ---
 
