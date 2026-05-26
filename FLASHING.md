@@ -56,6 +56,35 @@ These `mboot32.xx` files are what U-Boot loads via `fatload`.
 
 ---
 
+## Prerequisite: Patch U-Boot Environment (one-time, on a fresh device)
+
+**Required before any UART-interrupt procedure below** (Method 1 Step 5,
+Recovery, U-Boot prompt access in general). A fresh HY310 ships with **stock
+U-Boot configured with `bootdelay=0`** — keypresses over UART are not even
+sampled. You have **no way to drop into the U-Boot prompt** until the
+environment is patched.
+
+The patcher rewrites `env_a` (mmcblk0p3) with a CRC32-correct env that does
+two things:
+
+| Env-Var | Value | Why |
+|---|---|---|
+| `bootdelay` | `5` | **The 5-second UART-interrupt window** — without this, no prompt. |
+| `bootcmd` | `usb start; run setargs_nand boot_normal` | Initialise USB PHY before boot, so `usb start` at the prompt actually finds devices. |
+
+```bash
+# See: https://github.com/well0nez/sunxi-env-patcher
+python3 sunxi-env-patcher/patch_env.py
+```
+
+The patcher itself is run *on* the HY310 (it writes `/dev/mmcblk0p3` directly).
+On a brand-new device that means: dump `env_a` from stock Android (root shell
+or recovery) → patch on a host with the same tool → write back to `mmcblk0p3`
+from the same Android shell. After that one reboot you have `bootdelay=5` and
+everything below works. **Do this before attempting Method 1 or any recovery.**
+
+---
+
 ## Method 1: USB Stick Boot (First Boot / Testing)
 
 This is the easiest way to get started. You need a USB stick (any size, 4GB+
@@ -100,7 +129,9 @@ sudo umount /mnt
 ### Step 5: Boot from USB
 
 Plug the USB stick into the HY310, then at the U-Boot prompt (interrupt
-via UART during the 5-second bootdelay):
+via UART during the 5-second `bootdelay` window — this **requires the env_a
+patch from the [Prerequisite](#prerequisite-patch-u-boot-environment-one-time-on-a-fresh-device)
+section**, otherwise stock `bootdelay=0` gives you no window at all):
 
 ```
 usb start
@@ -126,20 +157,11 @@ or you can connect via:
 Once you have a working USB stick boot, you can flash the kernel permanently
 to eMMC so it auto-boots without UART intervention.
 
-### First-Time Setup: Patch U-Boot Environment
-
-The stock U-Boot env needs a one-time patch to add `usb start` to the
-boot command (required for USB PHY initialization):
-
-```bash
-# See: https://github.com/well0nez/sunxi-env-patcher
-python3 sunxi-env-patcher/patch_env.py
-```
-
-This patches `env_a` (mmcblk0p3) with the correct CRC32 checksum.
-**Bootcmd becomes:** `usb start; run setargs_nand boot_normal`
-
 ### Flash the Boot Image
+
+> The one-time env_a patch (sets `bootdelay=5` + `bootcmd += usb start`) is
+> a hard prerequisite — see [Prerequisite: Patch U-Boot Environment](#prerequisite-patch-u-boot-environment-one-time-on-a-fresh-device)
+> above.
 
 Use the manual hash-chain verified flash workflow (only boot_a, `/dev/mmcblk0p5`):
 
@@ -213,6 +235,6 @@ bootm 45000000
 The HY310 serial console is at 115200 8N1. See [docs/subsystems/uart.md](docs/subsystems/uart.md) for
 hardware connection details, U-Boot interrupt instructions, and recovery commands.
 
-> **NOTE:** The stock U-Boot has `bootdelay=0` — you cannot interrupt boot without
-> first patching the environment. Use [sunxi-env-patcher](https://github.com/well0nez/sunxi-env-patcher)
-> to set `bootdelay=5` before attempting any UART-based recovery.
+> The UART interrupt window only exists *after* the env_a patch — see the
+> [Prerequisite](#prerequisite-patch-u-boot-environment-one-time-on-a-fresh-device)
+> section at the top.
